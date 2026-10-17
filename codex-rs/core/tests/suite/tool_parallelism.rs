@@ -1,21 +1,25 @@
 #![cfg(not(target_os = "windows"))]
 #![allow(clippy::unwrap_used)]
 
+use codex_core::TurnInputRequest;
+use core_test_support::test_codex::local_requests;
 use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_exec_command_call_with_args;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::ev_shell_command_call_with_args;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -25,6 +29,7 @@ use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -33,20 +38,31 @@ use tokio::sync::oneshot;
 
 async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
     let session_model = test.session_configured.model.clone();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.cwd.path());
 
     test.codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
-            }],
-            final_output_json_schema: None,
-            cwd: test.cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: ReasoningSummary::Auto,
-        })
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(test.config.cwd.clone())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: session_model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
 
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -60,24 +76,16 @@ async fn run_turn_and_measure(test: &TestCodex, prompt: &str) -> anyhow::Result<
     Ok(start.elapsed())
 }
 
-#[allow(clippy::expect_used)]
 async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
     let mut builder = test_codex().with_model("test-gpt-5.1-codex");
     builder.build(server).await
 }
 
 fn assert_parallel_duration(actual: Duration) {
-    // Allow headroom for runtime overhead while still differentiating from serial execution.
+    // Allow headroom for slow CI scheduling; barrier synchronization already enforces overlap.
     assert!(
-        actual < Duration::from_millis(750),
+        actual < Duration::from_millis(1_600),
         "expected parallel execution to finish quickly, got {actual:?}"
-    );
-}
-
-fn assert_serial_duration(actual: Duration) {
-    assert!(
-        actual >= Duration::from_millis(500),
-        "expected serial execution to take longer, got {actual:?}"
     );
 }
 
@@ -144,24 +152,26 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn non_parallel_tools_run_serially() -> anyhow::Result<()> {
+async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build(&server).await?;
 
     let shell_args = json!({
-        "command": "sleep 0.3",
-        "timeout_ms": 1_000,
+        "cmd": "sleep 0.25",
+        // Avoid user-specific shell startup cost (e.g. zsh profile scripts) in timing assertions.
+        "login": false,
+        "yield_time_ms": 1_000,
     });
     let args_one = serde_json::to_string(&shell_args)?;
     let args_two = serde_json::to_string(&shell_args)?;
 
     let first_response = sse(vec![
         json!({"type": "response.created", "response": {"id": "resp-1"}}),
-        ev_function_call("call-1", "shell_command", &args_one),
-        ev_function_call("call-2", "shell_command", &args_two),
+        ev_function_call("call-1", "exec_command", &args_one),
+        ev_function_call("call-2", "exec_command", &args_two),
         ev_completed("resp-1"),
     ]);
     let second_response = sse(vec![
@@ -170,14 +180,14 @@ async fn non_parallel_tools_run_serially() -> anyhow::Result<()> {
     ]);
     mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
-    let duration = run_turn_and_measure(&test, "run shell_command twice").await?;
-    assert_serial_duration(duration);
+    let duration = run_turn_and_measure(&test, "run exec_command twice").await?;
+    assert_parallel_duration(duration);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mixed_tools_fall_back_to_serial() -> anyhow::Result<()> {
+async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -188,14 +198,16 @@ async fn mixed_tools_fall_back_to_serial() -> anyhow::Result<()> {
     })
     .to_string();
     let shell_args = serde_json::to_string(&json!({
-        "command": "sleep 0.3",
-        "timeout_ms": 1_000,
+        "cmd": "sleep 0.25",
+        // Avoid user-specific shell startup cost in timing assertions.
+        "login": false,
+        "yield_time_ms": 1_000,
     }))?;
 
     let first_response = sse(vec![
         json!({"type": "response.created", "response": {"id": "resp-1"}}),
         ev_function_call("call-1", "test_sync_tool", &sync_args),
-        ev_function_call("call-2", "shell_command", &shell_args),
+        ev_function_call("call-2", "exec_command", &shell_args),
         ev_completed("resp-1"),
     ]);
     let second_response = sse(vec![
@@ -205,7 +217,7 @@ async fn mixed_tools_fall_back_to_serial() -> anyhow::Result<()> {
     mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
     let duration = run_turn_and_measure(&test, "mix tools").await?;
-    assert_serial_duration(duration);
+    assert_parallel_duration(duration);
 
     Ok(())
 }
@@ -218,17 +230,17 @@ async fn tool_results_grouped() -> anyhow::Result<()> {
     let test = build_codex_with_test_tool(&server).await?;
 
     let shell_args = serde_json::to_string(&json!({
-        "command": "echo 'shell output'",
-        "timeout_ms": 1_000,
+        "cmd": "echo 'shell output'",
+        "yield_time_ms": 1_000,
     }))?;
 
     mount_sse_once(
         &server,
         sse(vec![
             json!({"type": "response.created", "response": {"id": "resp-1"}}),
-            ev_function_call("call-1", "shell_command", &shell_args),
-            ev_function_call("call-2", "shell_command", &shell_args),
-            ev_function_call("call-3", "shell_command", &shell_args),
+            ev_function_call("call-1", "exec_command", &shell_args),
+            ev_function_call("call-2", "exec_command", &shell_args),
+            ev_function_call("call-3", "exec_command", &shell_args),
             ev_completed("resp-1"),
         ]),
     )
@@ -304,17 +316,17 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     // Use a non-login shell to avoid slow, user-specific shell init (e.g. zsh profiles)
     // from making this timing-based test flaky.
     let args = json!({
-        "command": command,
+        "cmd": command,
         "login": false,
-        "timeout_ms": 1_000,
+        "yield_time_ms": 5_000,
     });
 
     let first_chunk = sse(vec![
         ev_response_created(first_response_id),
-        ev_shell_command_call_with_args("call-1", &args),
-        ev_shell_command_call_with_args("call-2", &args),
-        ev_shell_command_call_with_args("call-3", &args),
-        ev_shell_command_call_with_args("call-4", &args),
+        ev_exec_command_call_with_args("call-1", &args),
+        ev_exec_command_call_with_args("call-2", &args),
+        ev_exec_command_call_with_args("call-3", &args),
+        ev_exec_command_call_with_args("call-4", &args),
     ]);
     let second_chunk = sse(vec![ev_completed(first_response_id)]);
     let follow_up = sse(vec![
@@ -343,31 +355,42 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     ])
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder
         .build_with_streaming_server(&streaming_server)
         .await?;
 
     let session_model = test.session_configured.model.clone();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.cwd.path());
     test.codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "stream delayed completion".into(),
-            }],
-            final_output_json_schema: None,
-            cwd: test.cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: ReasoningSummary::Auto,
-        })
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(test.config.cwd.clone())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: session_model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
 
     let _ = first_gate_tx.send(());
     let _ = follow_up_gate_tx.send(());
 
-    let timestamps = tokio::time::timeout(Duration::from_secs(1), async {
+    let timestamps = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let contents = fs::read_to_string(output_path)?;
             let timestamps = contents

@@ -4,6 +4,9 @@ pub type Result<T> = std::result::Result<T, MetricsError>;
 
 #[derive(Debug, Error)]
 pub enum MetricsError {
+    #[error("operation metrics exceed the metadata size or tag count limit")]
+    OperationMetadataTooLarge,
+
     // Metrics.
     #[error("metric name cannot be empty")]
     EmptyMetricName,
@@ -31,6 +34,15 @@ pub enum MetricsError {
 
     #[error("failed to flush or shutdown metrics provider")]
     ProviderShutdown {
+        #[source]
+        source: opentelemetry_sdk::error::OTelSdkError,
+    },
+
+    #[error("runtime metrics snapshot reader is not enabled")]
+    RuntimeSnapshotUnavailable,
+
+    #[error("failed to collect runtime metrics snapshot from metrics reader")]
+    RuntimeSnapshotCollect {
         #[source]
         source: opentelemetry_sdk::error::OTelSdkError,
     },

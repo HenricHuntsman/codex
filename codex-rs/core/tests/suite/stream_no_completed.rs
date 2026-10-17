@@ -1,64 +1,46 @@
 //! Verifies that the agent retries when the SSE stream terminates before
 //! delivering a `response.completed` event.
 
-use codex_core::ModelProviderInfo;
-use codex_core::WireApi;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
+use codex_core::TurnInputRequest;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::user_input::UserInput;
-use core_test_support::load_sse_fixture;
-use core_test_support::load_sse_fixture_with_id;
+use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use wiremock::Mock;
+use pretty_assertions::assert_eq;
+use std::net::TcpListener;
 use wiremock::MockServer;
-use wiremock::Request;
-use wiremock::Respond;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 
 fn sse_incomplete() -> String {
-    load_sse_fixture("tests/fixtures/incomplete_sse.json")
-}
-
-fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("../fixtures/completed_template.json", id)
+    responses::sse(vec![serde_json::json!({
+        "type": "response.output_item.done",
+    })])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_on_early_close() {
     skip_if_no_network!();
 
-    let server = MockServer::start().await;
+    let incomplete_sse = sse_incomplete();
+    let completed_sse = responses::sse_completed("resp_ok");
 
-    struct SeqResponder;
-    impl Respond for SeqResponder {
-        fn respond(&self, _: &Request) -> ResponseTemplate {
-            use std::sync::atomic::AtomicUsize;
-            use std::sync::atomic::Ordering;
-            static CALLS: AtomicUsize = AtomicUsize::new(0);
-            let n = CALLS.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_raw(sse_incomplete(), "text/event-stream")
-            } else {
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_raw(sse_completed("resp_ok"), "text/event-stream")
-            }
-        }
-    }
-
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(SeqResponder {})
-        .expect(2)
-        .mount(&server)
-        .await;
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_sse,
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: completed_sse,
+        }],
+    ])
+    .await;
 
     // Configure retry behavior explicitly to avoid mutating process-wide
     // environment variables.
@@ -66,12 +48,16 @@ async fn retries_on_early_close() {
     let model_provider = ModelProviderInfo {
         name: "openai".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        model_catalog_url: None,
         // Environment variable that should exist in the test environment.
         // ModelClient will return an error if the environment variable for the
         // provider is not set.
         env_key: Some("PATH".into()),
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth: None,
+        gateway_oauth: None,
+        aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -80,27 +66,105 @@ async fn retries_on_early_close() {
         request_max_retries: Some(0),
         stream_max_retries: Some(1),
         stream_idle_timeout_ms: Some(2000),
+        websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
+        supports_websockets: false,
+        supports_standalone_web_search: false,
+        capabilities: None,
+        include_internal_metadata: false,
     };
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
             config.model_provider = model_provider;
         })
-        .build(&server)
+        .build_with_streaming_server(&server)
         .await
         .unwrap();
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-            }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
     // Wait until TurnComplete (should succeed after retry).
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected retry after incomplete SSE stream"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_failure_pauses_retry_budget_until_provider_is_reachable() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let bootstrap_server = responses::start_mock_server().await;
+    let unavailable_listener = TcpListener::bind("127.0.0.1:0")?;
+    let unavailable_address = unavailable_listener.local_addr()?;
+    drop(unavailable_listener);
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(format!("http://{unavailable_address}/v1"));
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(1);
+            config.model_provider.supports_websockets = false;
+        })
+        .build_with_auto_env(&bootstrap_server)
+        .await?;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "recover after the network returns".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let EventMsg::StreamError(connection_error) =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::StreamError(_))).await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(
+        connection_error.message,
+        "Reconnecting... waiting for network"
+    );
+
+    let recovered_server = MockServer::builder()
+        .listener(TcpListener::bind(unavailable_address)?)
+        .start()
+        .await;
+    let response_mock = responses::mount_sse_sequence(
+        &recovered_server,
+        vec![sse_incomplete(), responses::sse_completed("resp_recovered")],
+    )
+    .await;
+
+    let EventMsg::StreamError(stream_error) =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::StreamError(_))).await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(stream_error.message, "Reconnecting... 1/1");
+
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+
+    assert_eq!(completed.error, None);
+    assert_eq!(response_mock.requests().len(), 2);
+
+    Ok(())
 }

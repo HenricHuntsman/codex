@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 //! Integration tests that cover compacting, resuming, and forking conversations.
 //!
 //! Each test sets up a mocked SSE conversation and drives the conversation through
@@ -10,34 +8,44 @@
 use super::compact::COMPACT_WARNING_MESSAGE;
 use super::compact::FIRST_REPLY;
 use super::compact::SUMMARY_TEXT;
-use codex_core::CodexAuth;
+use anyhow::Context;
+use anyhow::Result;
 use codex_core::CodexThread;
-use codex_core::ModelProviderInfo;
-use codex_core::NewThread;
 use codex_core::ThreadManager;
-use codex_core::built_in_model_providers;
+use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Config;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::WarningEvent;
 use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_history::CodexHarnessMetadata;
+use codex_history::RolloutItem;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
-use core_test_support::load_default_config_for_test;
+use core_test_support::ThreadIdle;
 use core_test_support::responses::ResponseMock;
+use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::mount_sse_once_match;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
 const AFTER_SECOND_RESUME: &str = "AFTER_SECOND_RESUME";
+const CHECKPOINT_METADATA_KEY: &str = "replacement_history_metadata";
 
 fn network_disabled() -> bool {
     std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok()
@@ -54,29 +62,6 @@ fn json_fragment(text: &str) -> String {
         .to_string()
 }
 
-fn filter_out_ghost_snapshot_entries(items: &[Value]) -> Vec<Value> {
-    items
-        .iter()
-        .filter(|item| !is_ghost_snapshot_message(item))
-        .cloned()
-        .collect()
-}
-
-fn is_ghost_snapshot_message(item: &Value) -> bool {
-    if item.get("type").and_then(Value::as_str) != Some("message") {
-        return false;
-    }
-    if item.get("role").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    item.get("content")
-        .and_then(Value::as_array)
-        .and_then(|content| content.first())
-        .and_then(|entry| entry.get("text"))
-        .and_then(Value::as_str)
-        .is_some_and(|text| text.trim_start().starts_with("<ghost_snapshot>"))
-}
-
 fn normalize_line_endings_str(text: &str) -> String {
     if text.contains('\r') {
         text.replace("\r\n", "\n").replace('\r', "\n")
@@ -85,26 +70,99 @@ fn normalize_line_endings_str(text: &str) -> String {
     }
 }
 
-fn extract_summary_message(request: &Value, summary_text: &str) -> Value {
+fn response_message_contains_text(item: &ResponseItem, expected: &str) -> bool {
+    matches!(
+        item,
+        ResponseItem::Message { role, content, .. }
+            if role == "user"
+                && content.iter().any(|item| {
+                    matches!(item, ContentItem::InputText { text } if text == expected)
+                })
+    )
+}
+
+fn seed_first_checkpoint_harness_metadata(path: &Path, retained_text: &str) -> Result<()> {
+    let mut lines = std::fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(codex_rollout::parse_rollout_line)
+        .collect::<Result<Vec<_>, _>>()?;
+    let replacement_history = lines
+        .iter_mut()
+        .find_map(|line| match &mut line.item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_mut(),
+            _ => None,
+        })
+        .context("first compacted checkpoint missing replacement history")?;
+    replacement_history
+        .iter()
+        .find(|envelope| response_message_contains_text(&envelope.item, retained_text))
+        .context("retained user message missing from first compacted checkpoint")?;
+    for envelope in replacement_history {
+        envelope.metadata = Some(CodexHarnessMetadata::default());
+    }
+
+    let rewritten = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    std::fs::write(path, format!("{rewritten}\n"))?;
+    Ok(())
+}
+
+fn assert_latest_checkpoint_retains_harness_metadata(
+    path: &Path,
+    retained_text: &str,
+) -> Result<()> {
+    let replacement_history = std::fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(codex_rollout::parse_rollout_line)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .rev()
+        .find_map(|line| match line.item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history,
+            _ => None,
+        })
+        .context("latest compacted checkpoint missing replacement history")?;
+    assert!(
+        replacement_history.iter().any(|envelope| {
+            response_message_contains_text(&envelope.item, retained_text)
+                && envelope.metadata.is_some()
+        }),
+        "latest compacted checkpoint should retain aligned harness metadata on {retained_text:?}"
+    );
+    Ok(())
+}
+
+fn extract_summary_user_text(request: &Value, summary_text: &str) -> String {
+    json_message_input_texts(request, "user")
+        .into_iter()
+        .find(|text| text.contains(summary_text))
+        .expect("expected summary message")
+}
+
+fn json_message_input_texts(request: &Value, role: &str) -> Vec<String> {
     request
         .get("input")
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find(|item| {
-                item.get("type").and_then(Value::as_str) == Some("message")
-                    && item.get("role").and_then(Value::as_str) == Some("user")
-                    && item
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| arr.first())
-                        .and_then(|entry| entry.get("text"))
-                        .and_then(Value::as_str)
-                        .map(|text| text.contains(summary_text))
-                        .unwrap_or(false)
-            })
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some(role)
         })
-        .cloned()
-        .unwrap_or_else(|| panic!("expected summary message {summary_text}"))
+        .filter_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|entry| entry.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn normalize_compact_prompts(requests: &mut [Value]) {
@@ -117,21 +175,18 @@ fn normalize_compact_prompts(requests: &mut [Value]) {
                 {
                     return true;
                 }
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .cloned()
+                let Some(content) = item.get("content").and_then(Value::as_array) else {
+                    return false;
+                };
+                let Some(first) = content.first() else {
+                    return false;
+                };
+                let text = first
+                    .get("text")
+                    .and_then(Value::as_str)
                     .unwrap_or_default();
-                if let Some(first) = content.first() {
-                    let text = first
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let normalized_text = normalize_line_endings_str(text);
-                    !(text.is_empty() || normalized_text == normalized_summary_prompt)
-                } else {
-                    false
-                }
+                let normalized_text = normalize_line_endings_str(text);
+                !(text.is_empty() || normalized_text == normalized_summary_prompt)
             });
         }
     }
@@ -149,7 +204,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     // 1. Arrange mocked SSE responses for the initial compact/resume/fork flow.
     let server = MockServer::start().await;
     let request_log = mount_initial_flow(&server).await;
-    let expected_model = "gpt-5.1-codex";
+    let expected_model = "gpt-5.4";
     // 2. Start a new conversation and drive it through the compact/resume/fork steps.
     let (_home, config, manager, base) =
         start_test_conversation(&server, Some(expected_model)).await;
@@ -157,21 +212,22 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     user_turn(&base, "hello world").await;
     compact_conversation(&base).await;
     user_turn(&base, "AFTER_COMPACT").await;
-    let base_path = fetch_conversation_path(&base).await;
+    let base_path = fetch_conversation_path(&base);
     assert!(
         base_path.exists(),
         "compact+resume test expects base path {base_path:?} to exist",
     );
 
+    shutdown_conversation(&base).await;
     let resumed = resume_conversation(&manager, &config, base_path).await;
     user_turn(&resumed, "AFTER_RESUME").await;
-    let resumed_path = fetch_conversation_path(&resumed).await;
+    let resumed_path = fetch_conversation_path(&resumed);
     assert!(
         resumed_path.exists(),
         "compact+resume test expects resumed path {resumed_path:?} to exist",
     );
 
-    let forked = fork_thread(&manager, &config, resumed_path, 2).await;
+    let forked = fork_thread(&manager, &config, resumed_path, /*nth_user_message*/ 2).await;
     user_turn(&forked, "AFTER_FORK").await;
 
     // 3. Capture the requests to the model and validate the history slices.
@@ -181,7 +237,9 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     // input after compact is a prefix of input after resume/fork
     let input_after_compact = json!(requests[requests.len() - 3]["input"]);
     let input_after_resume = json!(requests[requests.len() - 2]["input"]);
-    let input_after_fork = json!(requests[requests.len() - 1]["input"]);
+    let mut input_after_fork = json!(requests[requests.len() - 1]["input"]);
+    // The request prefix has a thread-scoped ID; retained history IDs stay unchanged.
+    input_after_fork[0]["id"] = input_after_compact[0]["id"].clone();
 
     let compact_arr = input_after_compact
         .as_array()
@@ -208,437 +266,155 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
         &fork_arr[..compact_arr.len()]
     );
 
-    let expected_model = requests[0]["model"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let prompt = requests[0]["instructions"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let user_instructions = requests[0]["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let environment_context = requests[0]["input"][1]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let tool_calls = json!(requests[0]["tools"].as_array());
-    let prompt_cache_key = requests[0]["prompt_cache_key"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let fork_prompt_cache_key = requests[requests.len() - 1]["prompt_cache_key"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let summary_after_compact = extract_summary_message(&requests[2], SUMMARY_TEXT);
-    let summary_after_resume = extract_summary_message(&requests[3], SUMMARY_TEXT);
-    let summary_after_fork = extract_summary_message(&requests[4], SUMMARY_TEXT);
-    let user_turn_1 = json!(
-    {
-      "model": expected_model,
-      "instructions": prompt,
-      "input": [
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": user_instructions
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": environment_context
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "hello world"
-            }
-          ]
+    let first_request_user_texts = json_message_input_texts(&requests[0], "user");
+    let first_turn_user_index = first_request_user_texts
+        .len()
+        .checked_sub(1)
+        .expect("first turn request missing user messages");
+    assert_eq!(
+        first_request_user_texts[first_turn_user_index],
+        "hello world"
+    );
+    let seeded_user_prefix = &first_request_user_texts[..first_turn_user_index];
+    let summary_after_compact = extract_summary_user_text(&requests[2], SUMMARY_TEXT);
+    let summary_after_resume = extract_summary_user_text(&requests[3], SUMMARY_TEXT);
+    let summary_after_fork = extract_summary_user_text(&requests[4], SUMMARY_TEXT);
+    let mut expected_after_compact_user_texts = seeded_user_prefix.to_vec();
+    expected_after_compact_user_texts.extend(["hello world".to_string(), summary_after_compact]);
+    expected_after_compact_user_texts.push("AFTER_COMPACT".to_string());
+    assert_eq!(
+        json_message_input_texts(&requests[2], "user"),
+        expected_after_compact_user_texts
+    );
+
+    let mut expected_after_resume_user_texts = seeded_user_prefix.to_vec();
+    expected_after_resume_user_texts.extend(["hello world".to_string(), summary_after_resume]);
+    expected_after_resume_user_texts.push("AFTER_COMPACT".to_string());
+    let after_resume_user_texts = json_message_input_texts(&requests[3], "user");
+    let (after_resume_last, after_resume_prefix) = after_resume_user_texts
+        .split_last()
+        .expect("after-resume request missing user messages");
+    assert_eq!(after_resume_last, "AFTER_RESUME");
+    assert!(
+        after_resume_prefix.starts_with(&expected_after_resume_user_texts),
+        "after-resume user texts should preserve compacted history prefix"
+    );
+    let after_resume_seeded_suffix = &after_resume_prefix[expected_after_resume_user_texts.len()..];
+    if seeded_user_prefix.is_empty() {
+        assert!(
+            after_resume_seeded_suffix.is_empty(),
+            "after-resume request should not append unexpected user prefix items"
+        );
+    } else {
+        let mut chunks = after_resume_seeded_suffix.chunks_exact(seeded_user_prefix.len());
+        assert!(
+            chunks.remainder().is_empty(),
+            "after-resume suffix should be whole seeded-prefix repeats"
+        );
+        for chunk in &mut chunks {
+            assert_eq!(chunk, seeded_user_prefix);
         }
-      ],
-      "tools": tool_calls,
-      "tool_choice": "auto",
-      "parallel_tool_calls": false,
-      "reasoning": {
-        "summary": "auto"
-      },
-      "store": false,
-      "stream": true,
-      "include": [
-        "reasoning.encrypted_content"
-      ],
-      "prompt_cache_key": prompt_cache_key
-    });
-    let compact_1 = json!(
-    {
-      "model": expected_model,
-      "instructions": prompt,
-      "input": [
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": user_instructions
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": environment_context
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "hello world"
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "assistant",
-          "content": [
-            {
-              "type": "output_text",
-              "text": "FIRST_REPLY"
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": SUMMARIZATION_PROMPT
-            }
-          ]
+    }
+
+    let after_fork_user_texts = json_message_input_texts(&requests[4], "user");
+    let mut expected_after_fork_history_prefix = seeded_user_prefix.to_vec();
+    expected_after_fork_history_prefix.extend(["hello world".to_string(), summary_after_fork]);
+    expected_after_fork_history_prefix.push("AFTER_COMPACT".to_string());
+    let (after_fork_last, after_fork_prefix) = after_fork_user_texts
+        .split_last()
+        .expect("after-fork request missing user messages");
+    assert_eq!(after_fork_last, "AFTER_FORK");
+    assert!(
+        after_fork_prefix.starts_with(&expected_after_fork_history_prefix),
+        "after-fork user texts should preserve compacted user history prefix"
+    );
+    let after_fork_seeded_suffix = &after_fork_prefix[expected_after_fork_history_prefix.len()..];
+    if seeded_user_prefix.is_empty() {
+        assert!(
+            after_fork_seeded_suffix.is_empty(),
+            "after-fork request should not append unexpected user prefix items"
+        );
+    } else {
+        let mut chunks = after_fork_seeded_suffix.chunks_exact(seeded_user_prefix.len());
+        assert!(
+            chunks.remainder().is_empty(),
+            "after-fork suffix should be whole seeded-prefix repeats"
+        );
+        for chunk in &mut chunks {
+            assert_eq!(chunk, seeded_user_prefix);
         }
-      ],
-      "tools": [],
-      "tool_choice": "auto",
-      "parallel_tool_calls": false,
-      "reasoning": {
-        "summary": "auto"
-      },
-      "store": false,
-      "stream": true,
-      "include": [
-        "reasoning.encrypted_content"
-      ],
-      "prompt_cache_key": prompt_cache_key
-    });
-    let user_turn_2_after_compact = json!(
-    {
-      "model": expected_model,
-      "instructions": prompt,
-      "input": [
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": user_instructions
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": environment_context
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "hello world"
-            }
-          ]
-        },
-        summary_after_compact,
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "AFTER_COMPACT"
-            }
-          ]
-        }
-      ],
-      "tools": tool_calls,
-      "tool_choice": "auto",
-      "parallel_tool_calls": false,
-      "reasoning": {
-        "summary": "auto"
-      },
-      "store": false,
-      "stream": true,
-      "include": [
-        "reasoning.encrypted_content"
-      ],
-      "prompt_cache_key": prompt_cache_key
-    });
-    let usert_turn_3_after_resume = json!(
-    {
-      "model": expected_model,
-      "instructions": prompt,
-      "input": [
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": user_instructions
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": environment_context
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "hello world"
-            }
-          ]
-        },
-        summary_after_resume,
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "AFTER_COMPACT"
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "assistant",
-          "content": [
-            {
-              "type": "output_text",
-              "text": "AFTER_COMPACT_REPLY"
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "AFTER_RESUME"
-            }
-          ]
-        }
-      ],
-      "tools": tool_calls,
-      "tool_choice": "auto",
-      "parallel_tool_calls": false,
-      "reasoning": {
-        "summary": "auto"
-      },
-      "store": false,
-      "stream": true,
-      "include": [
-        "reasoning.encrypted_content"
-      ],
-      "prompt_cache_key": prompt_cache_key
-    });
-    let user_turn_3_after_fork = json!(
-    {
-      "model": expected_model,
-      "instructions": prompt,
-      "input": [
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": user_instructions
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": environment_context
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "hello world"
-            }
-          ]
-        },
-        summary_after_fork,
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "AFTER_COMPACT"
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "assistant",
-          "content": [
-            {
-              "type": "output_text",
-              "text": "AFTER_COMPACT_REPLY"
-            }
-          ]
-        },
-        {
-          "type": "message",
-          "role": "user",
-          "content": [
-            {
-              "type": "input_text",
-              "text": "AFTER_FORK"
-            }
-          ]
-        }
-      ],
-      "tools": tool_calls,
-      "tool_choice": "auto",
-      "parallel_tool_calls": false,
-      "reasoning": {
-        "summary": "auto"
-      },
-      "store": false,
-      "stream": true,
-      "include": [
-        "reasoning.encrypted_content"
-      ],
-      "prompt_cache_key": fork_prompt_cache_key
-    });
-    let mut expected = json!([
-        user_turn_1,
-        compact_1,
-        user_turn_2_after_compact,
-        usert_turn_3_after_resume,
-        user_turn_3_after_fork
-    ]);
-    normalize_line_endings(&mut expected);
-    if let Some(arr) = expected.as_array_mut() {
-        normalize_compact_prompts(arr);
     }
     assert_eq!(requests.len(), 5);
-    assert_eq!(json!(requests), expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: after the forked branch is compacted, resuming again should reuse
 /// the compacted history and only append the new user message.
-async fn compact_resume_after_second_compaction_preserves_history() {
+async fn compact_resume_after_second_compaction_preserves_history() -> Result<()> {
     if network_disabled() {
         println!("Skipping test because network is disabled in this sandbox");
-        return;
+        return Ok(());
     }
 
-    // 1. Arrange mocked SSE responses for the initial flow plus the second compact.
+    // 1. Arrange mocked SSE responses as a single ordered stream so assertions
+    // observe the real request sequence instead of per-mock duplicate captures.
     let server = MockServer::start().await;
-    let mut request_log = mount_initial_flow(&server).await;
-    request_log.extend(mount_second_compact_flow(&server).await);
+    let request_log = mount_second_compact_sequence(&server).await;
 
     // 2. Drive the conversation through compact -> resume -> fork -> compact -> resume.
-    let (_home, config, manager, base) = start_test_conversation(&server, None).await;
+    let (_home, config, manager, base) = start_test_conversation(&server, /*model*/ None).await;
 
     user_turn(&base, "hello world").await;
     compact_conversation(&base).await;
     user_turn(&base, "AFTER_COMPACT").await;
-    let base_path = fetch_conversation_path(&base).await;
+    let base_path = fetch_conversation_path(&base);
     assert!(
         base_path.exists(),
         "second compact test expects base path {base_path:?} to exist",
     );
 
+    shutdown_conversation(&base).await;
+    seed_first_checkpoint_harness_metadata(&base_path, "hello world")?;
     let resumed = resume_conversation(&manager, &config, base_path).await;
     user_turn(&resumed, "AFTER_RESUME").await;
-    let resumed_path = fetch_conversation_path(&resumed).await;
+    let resumed_path = fetch_conversation_path(&resumed);
     assert!(
         resumed_path.exists(),
         "second compact test expects resumed path {resumed_path:?} to exist",
     );
 
-    let forked = fork_thread(&manager, &config, resumed_path, 3).await;
+    let forked = fork_thread(&manager, &config, resumed_path, /*nth_user_message*/ 3).await;
     user_turn(&forked, "AFTER_FORK").await;
 
     compact_conversation(&forked).await;
     user_turn(&forked, "AFTER_COMPACT_2").await;
-    let forked_path = fetch_conversation_path(&forked).await;
+    let forked_path = fetch_conversation_path(&forked);
     assert!(
         forked_path.exists(),
         "second compact test expects forked path {forked_path:?} to exist",
     );
 
+    shutdown_conversation(&forked).await;
+    assert_latest_checkpoint_retains_harness_metadata(&forked_path, "hello world")?;
     let resumed_again = resume_conversation(&manager, &config, forked_path).await;
     user_turn(&resumed_again, AFTER_SECOND_RESUME).await;
 
-    let mut requests = gather_request_bodies(&request_log);
+    let mut requests = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json())
+        .collect::<Vec<_>>();
+    requests.iter_mut().for_each(normalize_line_endings);
     normalize_compact_prompts(&mut requests);
+    assert!(
+        requests
+            .iter()
+            .flat_map(|request| request["input"].as_array().expect("provider request input"))
+            .all(|item| {
+                item.get(CHECKPOINT_METADATA_KEY).is_none() && item.get("metadata").is_none()
+            }),
+        "provider requests must not contain harness metadata"
+    );
     let input_after_compact = json!(requests[requests.len() - 2]["input"]);
     let input_after_resume = json!(requests[requests.len() - 1]["input"]);
 
@@ -649,113 +425,84 @@ async fn compact_resume_after_second_compaction_preserves_history() {
     let resume_input_array = input_after_resume
         .as_array()
         .expect("input after resume should be an array");
-    let compact_filtered = filter_out_ghost_snapshot_entries(compact_input_array);
-    let resume_filtered = filter_out_ghost_snapshot_entries(resume_input_array);
     assert!(
-        compact_filtered.len() <= resume_filtered.len(),
+        compact_input_array.len() <= resume_input_array.len(),
         "after-resume input should have at least as many items as after-compact"
     );
     assert_eq!(
-        compact_filtered.as_slice(),
-        &resume_filtered[..compact_filtered.len()]
+        compact_input_array.as_slice(),
+        &resume_input_array[..compact_input_array.len()]
     );
-    // hard coded test
-    let prompt = requests[0]["instructions"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let user_instructions = requests[0]["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let environment_instructions = requests[0]["input"][1]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-
-    // Build expected final request input: initial context + forked user message +
-    // compacted summary + post-compact user message + resumed user message.
+    let first_request_user_texts = json_message_input_texts(&requests[0], "user");
+    let first_turn_user_index = first_request_user_texts
+        .len()
+        .checked_sub(1)
+        .expect("first turn request missing user messages");
+    assert_eq!(
+        first_request_user_texts[first_turn_user_index],
+        "hello world"
+    );
+    let seeded_user_prefix = &first_request_user_texts[..first_turn_user_index];
     let summary_after_second_compact =
-        extract_summary_message(&requests[requests.len() - 3], SUMMARY_TEXT);
-
-    let mut expected = json!([
-      {
-        "instructions": prompt,
-        "input": [
-          {
-            "type": "message",
-            "role": "user",
-            "content": [
-              {
-                "type": "input_text",
-                "text": user_instructions
-              }
-            ]
-          },
-          {
-            "type": "message",
-            "role": "user",
-            "content": [
-              {
-                "type": "input_text",
-                "text": environment_instructions
-              }
-            ]
-          },
-          {
-            "type": "message",
-            "role": "user",
-            "content": [
-              {
-                "type": "input_text",
-                "text": "AFTER_FORK"
-              }
-            ]
-          },
-          summary_after_second_compact,
-          {
-            "type": "message",
-            "role": "user",
-            "content": [
-              {
-                "type": "input_text",
-                "text": "AFTER_COMPACT_2"
-              }
-            ]
-          },
-          {
-            "type": "message",
-            "role": "user",
-            "content": [
-              {
-                "type": "input_text",
-                "text": "AFTER_SECOND_RESUME"
-              }
-            ]
-          }
-        ],
-      }
+        extract_summary_user_text(&requests[requests.len() - 2], SUMMARY_TEXT);
+    let mut expected_after_second_compact_user_texts = vec![
+        "hello world".to_string(),
+        "AFTER_COMPACT".to_string(),
+        "AFTER_RESUME".to_string(),
+    ];
+    expected_after_second_compact_user_texts.extend_from_slice(seeded_user_prefix);
+    expected_after_second_compact_user_texts.extend([
+        "AFTER_FORK".to_string(),
+        summary_after_second_compact.clone(),
+        "AFTER_COMPACT_2".to_string(),
     ]);
-    normalize_line_endings(&mut expected);
-    let mut last_request_after_2_compacts = json!([{
-        "instructions": requests[requests.len() -1]["instructions"],
-        "input": requests[requests.len() -1]["input"],
-    }]);
-    if let Some(arr) = expected.as_array_mut() {
-        normalize_compact_prompts(arr);
+    let mut expected_fork_local_user_texts = seeded_user_prefix.to_vec();
+    expected_fork_local_user_texts.extend([
+        "AFTER_FORK".to_string(),
+        summary_after_second_compact,
+        "AFTER_COMPACT_2".to_string(),
+    ]);
+    let final_user_texts = json_message_input_texts(&requests[requests.len() - 1], "user");
+    let (final_last, final_prefix) = final_user_texts
+        .split_last()
+        .expect("after-second-resume request missing user messages");
+    assert_eq!(final_last, AFTER_SECOND_RESUME);
+    let matched_prefix_len = if let Some(start) = final_prefix
+        .windows(expected_after_second_compact_user_texts.len())
+        .position(|window| window == expected_after_second_compact_user_texts)
+    {
+        start + expected_after_second_compact_user_texts.len()
+    } else if let Some(start) = final_prefix
+        .windows(expected_fork_local_user_texts.len())
+        .position(|window| window == expected_fork_local_user_texts)
+    {
+        start + expected_fork_local_user_texts.len()
+    } else {
+        panic!("after-second-resume user texts should preserve post-compact user history prefix");
+    };
+    let final_seeded_suffix = &final_prefix[matched_prefix_len..];
+    if seeded_user_prefix.is_empty() {
+        assert!(
+            final_seeded_suffix.is_empty(),
+            "after-second-resume request should not append unexpected user prefix items"
+        );
+    } else {
+        let mut chunks = final_seeded_suffix.chunks_exact(seeded_user_prefix.len());
+        assert!(
+            chunks.remainder().is_empty(),
+            "after-second-resume suffix should be whole seeded-prefix repeats"
+        );
+        for chunk in &mut chunks {
+            assert_eq!(chunk, seeded_user_prefix);
+        }
     }
-    if let Some(arr) = last_request_after_2_compacts.as_array_mut() {
-        normalize_compact_prompts(arr);
-    }
-    assert_eq!(expected, last_request_after_2_compacts);
+    Ok(())
 }
 
 fn normalize_line_endings(value: &mut Value) {
     match value {
-        Value::String(text) => {
-            if text.contains('\r') {
-                *text = text.replace("\r\n", "\n").replace('\r', "\n");
-            }
+        Value::String(text) if text.contains('\r') => {
+            *text = text.replace("\r\n", "\n").replace('\r', "\n");
         }
         Value::Array(items) => {
             for item in items {
@@ -771,15 +518,19 @@ fn normalize_line_endings(value: &mut Value) {
     }
 }
 
-fn gather_request_bodies(request_log: &[ResponseMock]) -> Vec<Value> {
-    let mut bodies = request_log
+fn gather_requests(request_log: &[ResponseMock]) -> Vec<ResponsesRequest> {
+    request_log
         .iter()
         .flat_map(ResponseMock::requests)
+        .collect::<Vec<_>>()
+}
+
+fn gather_request_bodies(request_log: &[ResponseMock]) -> Vec<Value> {
+    let mut bodies = gather_requests(request_log)
+        .into_iter()
         .map(|request| request.body_json())
         .collect::<Vec<_>>();
-    for body in &mut bodies {
-        normalize_line_endings(body);
-    }
+    bodies.iter_mut().for_each(normalize_line_endings);
     bodies
 }
 
@@ -838,65 +589,66 @@ async fn mount_initial_flow(server: &MockServer) -> Vec<ResponseMock> {
     vec![first, compact, after_compact, after_resume, after_fork]
 }
 
-async fn mount_second_compact_flow(server: &MockServer) -> Vec<ResponseMock> {
+async fn mount_second_compact_sequence(server: &MockServer) -> ResponseMock {
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", SUMMARY_TEXT),
+        ev_completed("r2"),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", "AFTER_COMPACT_REPLY"),
+        ev_completed("r3"),
+    ]);
+    let sse4 = sse(vec![ev_completed("r4")]);
+    let sse5 = sse(vec![ev_completed("r5")]);
     let sse6 = sse(vec![
         ev_assistant_message("m4", SUMMARY_TEXT),
         ev_completed("r6"),
     ]);
     let sse7 = sse(vec![ev_completed("r7")]);
+    let sse8 = sse(vec![ev_completed("r8")]);
 
-    let match_second_compact = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains("AFTER_FORK")
-    };
-    let second_compact = mount_sse_once_match(server, match_second_compact, sse6).await;
-
-    let match_after_second_resume = |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains(&format!("\"text\":\"{AFTER_SECOND_RESUME}\""))
-    };
-    let after_second_resume = mount_sse_once_match(server, match_after_second_resume, sse7).await;
-
-    vec![second_compact, after_second_resume]
+    mount_sse_sequence(server, vec![sse1, sse2, sse3, sse4, sse5, sse6, sse7, sse8]).await
 }
 
 async fn start_test_conversation(
     server: &MockServer,
     model: Option<&str>,
-) -> (TempDir, Config, ThreadManager, Arc<CodexThread>) {
-    let model_provider = ModelProviderInfo {
-        name: "Non-OpenAI Model provider".into(),
-        base_url: Some(format!("{}/v1", server.uri())),
-        ..built_in_model_providers()["openai"].clone()
-    };
-    let home = TempDir::new().expect("create temp dir");
-    let mut config = load_default_config_for_test(&home).await;
-    config.model_provider = model_provider;
-    config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-    if let Some(model) = model {
-        config.model = Some(model.to_string());
-    }
-    let manager = ThreadManager::with_models_provider(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-    );
-    let NewThread { thread, .. } = manager
-        .start_thread(config.clone())
+) -> (Arc<TempDir>, Config, Arc<ThreadManager>, Arc<CodexThread>) {
+    let base_url = format!("{}/v1", server.uri());
+    let model = model.map(str::to_string);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(move |config| {
+            config.update_plan_enabled = true;
+            config.model_provider.name = "Non-OpenAI Model provider".to_string();
+            config.model_provider.base_url = Some(base_url);
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            if let Some(model) = model {
+                config.model = Some(model);
+            }
+        });
+    let test = Box::pin(builder.build(server))
         .await
         .expect("create conversation");
-
-    (home, config, manager, thread)
+    (test.home, test.config, test.thread_manager, test.codex)
 }
 
 async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
     conversation
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text { text: text.into() }],
-            final_output_json_schema: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit user turn");
     wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    ThreadIdle::wait(conversation).await;
 }
 
 async fn compact_conversation(conversation: &Arc<CodexThread>) {
@@ -904,16 +656,30 @@ async fn compact_conversation(conversation: &Arc<CodexThread>) {
         .submit(Op::Compact)
         .await
         .expect("compact conversation");
-    let warning_event = wait_for_event(conversation, |ev| matches!(ev, EventMsg::Warning(_))).await;
+    let warning_event = wait_for_event(conversation, |ev| {
+        matches!(
+            ev,
+            EventMsg::Warning(WarningEvent { message }) if message == COMPACT_WARNING_MESSAGE
+        )
+    })
+    .await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
         panic!("expected warning event after compact");
     };
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
     wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    ThreadIdle::wait(conversation).await;
 }
 
-async fn fetch_conversation_path(conversation: &Arc<CodexThread>) -> std::path::PathBuf {
-    conversation.rollout_path()
+fn fetch_conversation_path(conversation: &Arc<CodexThread>) -> std::path::PathBuf {
+    conversation.rollout_path().expect("rollout path")
+}
+
+async fn shutdown_conversation(conversation: &Arc<CodexThread>) {
+    conversation
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown conversation");
 }
 
 async fn resume_conversation(
@@ -921,13 +687,19 @@ async fn resume_conversation(
     config: &Config,
     path: std::path::PathBuf,
 ) -> Arc<CodexThread> {
-    let auth_manager =
-        codex_core::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
-    let NewThread { thread, .. } = manager
-        .resume_thread_from_rollout(config.clone(), path, auth_manager)
-        .await
-        .expect("resume conversation");
-    thread
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        codex_login::CodexAuth::from_api_key("dummy"),
+    );
+    Box::pin(manager.resume_legacy_thread_from_rollout(
+        config.clone(),
+        path,
+        auth_manager,
+        /*parent_trace*/ None,
+        ClientMcpExtensions::default(),
+    ))
+    .await
+    .expect("resume conversation")
+    .thread
 }
 
 #[cfg(test)]
@@ -937,9 +709,12 @@ async fn fork_thread(
     path: std::path::PathBuf,
     nth_user_message: usize,
 ) -> Arc<CodexThread> {
-    let NewThread { thread, .. } = manager
-        .fork_thread(nth_user_message, config.clone(), path)
-        .await
-        .expect("fork conversation");
-    thread
+    Box::pin(manager.fork_legacy_thread(
+        nth_user_message,
+        codex_core::StartThreadOptions::new(config.clone()),
+        path,
+    ))
+    .await
+    .expect("fork conversation")
+    .thread
 }

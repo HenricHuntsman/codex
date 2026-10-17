@@ -1,28 +1,42 @@
 //! Shared approvals and sandboxing traits used by tool runtimes.
 //!
 //! Consolidates the approval flow primitives (`ApprovalDecision`, `ApprovalStore`,
-//! `ApprovalCtx`, `Approvable`) together with the sandbox orchestration traits
+//! `Approvable`) together with the sandbox orchestration traits
 //! and helpers (`Sandboxable`, `ToolRuntime`, `SandboxAttempt`, etc.).
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::error::CodexErr;
-use crate::protocol::SandboxPolicy;
-use crate::sandboxing::CommandSpec;
-use crate::sandboxing::SandboxManager;
-use crate::sandboxing::SandboxTransformError;
+use crate::sandboxing::ExecOptions;
+use crate::sandboxing::SandboxPermissions;
+use crate::session::session::Session;
+use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::state::SessionServices;
+use crate::tools::hook_names::HookToolName;
+use crate::tools::network_approval::NetworkApprovalSpec;
+use codex_file_system::FileSystemSandboxContext;
+use codex_file_system::WindowsSandboxSelection;
+use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::error::CodexErr;
+use codex_protocol::permissions::FileSystemSandboxKind;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::path::Path;
-
+pub(crate) use codex_protocol::sandbox::SandboxOverride;
+use codex_sandboxing::SandboxCommand;
+use codex_sandboxing::SandboxManager;
+use codex_sandboxing::SandboxTransformRequest;
+use codex_sandboxing::SandboxType;
+use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::effective_permission_profile;
+use codex_tools::ToolName;
+use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 use futures::Future;
-use futures::future::BoxFuture;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ApprovalStore {
@@ -84,9 +98,9 @@ where
 
     let decision = fetch().await;
 
-    services.otel_manager.counter(
+    services.session_telemetry.counter(
         "codex.approval.requested",
-        1,
+        /*inc*/ 1,
         &[
             ("tool", tool_name),
             ("approved", decision.to_opaque_string()),
@@ -103,12 +117,36 @@ where
     decision
 }
 
-#[derive(Clone)]
-pub(crate) struct ApprovalCtx<'a> {
-    pub session: &'a Session,
-    pub turn: &'a TurnContext,
-    pub call_id: &'a str,
-    pub retry_reason: Option<String>,
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ApprovalRequestReasons {
+    pub(crate) approval: Option<String>,
+    pub(crate) retry: Option<String>,
+}
+
+pub(crate) use super::approvals::ApprovalAction;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PermissionRequestPayload {
+    pub tool_name: HookToolName,
+    pub tool_input: serde_json::Value,
+}
+
+impl PermissionRequestPayload {
+    pub(crate) fn bash(command: String, description: Option<String>) -> Self {
+        let mut tool_input = serde_json::Map::new();
+        tool_input.insert("command".to_string(), serde_json::Value::String(command));
+        if let Some(description) = description {
+            tool_input.insert(
+                "description".to_string(),
+                serde_json::Value::String(description),
+            );
+        }
+
+        Self {
+            tool_name: HookToolName::bash(),
+            tool_input: serde_json::Value::Object(tool_input),
+        }
+    }
 }
 
 // Specifies what tool orchestrator should do with a given tool call.
@@ -150,23 +188,37 @@ impl ExecApprovalRequirement {
     }
 }
 
-/// - Never, OnFailure: do not ask
-/// - OnRequest: ask unless sandbox policy is DangerFullAccess
+/// - Never: do not ask
+/// - OnRequest: ask unless filesystem access is unrestricted
+/// - Granular: ask unless filesystem access is unrestricted, but auto-reject
+///   when granular sandbox approval is disabled.
 /// - UnlessTrusted: always ask
 pub(crate) fn default_exec_approval_requirement(
     policy: AskForApproval,
-    sandbox_policy: &SandboxPolicy,
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
 ) -> ExecApprovalRequirement {
     let needs_approval = match policy {
-        AskForApproval::Never | AskForApproval::OnFailure => false,
-        AskForApproval::OnRequest => !matches!(
-            sandbox_policy,
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-        ),
+        AskForApproval::Never => false,
+        AskForApproval::OnRequest | AskForApproval::Granular(_) => {
+            matches!(
+                file_system_sandbox_policy.kind,
+                FileSystemSandboxKind::Restricted
+            )
+        }
         AskForApproval::UnlessTrusted => true,
     };
 
-    if needs_approval {
+    if needs_approval
+        && matches!(
+            policy,
+            AskForApproval::Granular(granular_config)
+                if !granular_config.allows_sandbox_approval()
+        )
+    {
+        ExecApprovalRequirement::Forbidden {
+            reason: "approval policy disallowed sandbox approval prompt".to_string(),
+        }
+    } else if needs_approval {
         ExecApprovalRequirement::NeedsApproval {
             reason: None,
             proposed_execpolicy_amendment: None,
@@ -179,29 +231,100 @@ pub(crate) fn default_exec_approval_requirement(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SandboxOverride {
-    NoOverride,
-    BypassSandboxFirstAttempt,
+pub(crate) fn ensure_native_sandbox(
+    sandbox_override: SandboxOverride,
+    sandbox: SandboxType,
+) -> Result<(), ToolError> {
+    if sandbox_override == SandboxOverride::EscalatedSandboxWithRestrictions
+        && sandbox == SandboxType::None
+    {
+        return Err(ToolError::Rejected(
+            "command escalation with denied reads requires an available filesystem sandbox"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn sandbox_override_for_first_attempt(
+    sandbox_permissions: SandboxPermissions,
+    exec_approval_requirement: &ExecApprovalRequirement,
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    already_approved: bool,
+) -> SandboxOverride {
+    // Only actual approval of an explicit escalation may widen the filesystem;
+    // a command allow rule does not authorize removing filesystem restrictions.
+    if !unsandboxed_execution_allowed(file_system_sandbox_policy) {
+        return if sandbox_permissions.requires_escalated_permissions() && already_approved {
+            SandboxOverride::EscalatedSandboxWithRestrictions
+        } else {
+            SandboxOverride::NoOverride
+        };
+    }
+
+    // ExecPolicy `Allow` can intentionally imply full trust (Skip + bypass_sandbox=true),
+    // which supersedes `with_additional_permissions` sandboxed execution hints.
+    if matches!(
+        exec_approval_requirement,
+        ExecApprovalRequirement::Skip {
+            bypass_sandbox: true,
+            ..
+        }
+    ) {
+        return SandboxOverride::BypassSandboxFirstAttempt;
+    }
+
+    if sandbox_permissions.requires_escalated_permissions() {
+        SandboxOverride::BypassSandboxFirstAttempt
+    } else {
+        SandboxOverride::NoOverride
+    }
+}
+
+/// Returns true when the active filesystem policy can be represented by
+/// running without a filesystem sandbox.
+///
+/// Denied reads only exist inside the sandbox. If a policy contains any
+/// denied-read paths, bypassing the sandbox would silently grant those reads,
+/// so escalation must keep the command sandboxed with the denied reads intact.
+pub(crate) fn unsandboxed_execution_allowed(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+) -> bool {
+    !file_system_sandbox_policy.has_denied_read_restrictions()
+}
+
+pub(crate) fn sandbox_permissions_preserving_denied_reads(
+    sandbox_permissions: SandboxPermissions,
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+) -> SandboxPermissions {
+    if sandbox_permissions.requires_escalated_permissions()
+        && !unsandboxed_execution_allowed(file_system_sandbox_policy)
+    {
+        // `RequireEscalated` normally asks the executor to bypass the sandbox.
+        // When denied reads are active, that would drop the only mechanism that
+        // enforces them, so fall back to the default sandboxed attempt instead.
+        SandboxPermissions::UseDefault
+    } else {
+        sandbox_permissions
+    }
+}
+
+pub(crate) fn managed_network_for_sandbox_permissions(
+    network: Option<&NetworkProxy>,
+    sandbox_permissions: SandboxPermissions,
+) -> Option<&NetworkProxy> {
+    if sandbox_permissions.requires_escalated_permissions() {
+        None
+    } else {
+        network
+    }
 }
 
 pub(crate) trait Approvable<Req> {
-    type ApprovalKey: Hash + Eq + Clone + Debug + Serialize;
-
-    // In most cases (shell, unified_exec), a request will have a single approval key.
-    //
-    // However, apply_patch needs session "approve once, don't ask again" semantics that
-    // apply to multiple atomic targets (e.g., apply_patch approves per file path). Returning
-    // a list of keys lets the runtime treat the request as approved-for-session only if
-    // *all* keys are already approved, while still caching approvals per-key so future
-    // requests touching a subset can be auto-approved.
-    fn approval_keys(&self, req: &Req) -> Vec<Self::ApprovalKey>;
-
-    /// Some tools may request to skip the sandbox on the first attempt
-    /// (e.g., when the request explicitly asks for escalated permissions).
-    /// Defaults to `NoOverride`.
-    fn sandbox_mode_for_first_attempt(&self, _req: &Req) -> SandboxOverride {
-        SandboxOverride::NoOverride
+    /// Return per-request sandbox permissions for first-attempt sandbox
+    /// selection. Most tools use the ambient sandbox policy unchanged.
+    fn sandbox_permissions(&self, _req: &Req) -> SandboxPermissions {
+        SandboxPermissions::UseDefault
     }
 
     fn should_bypass_approval(&self, policy: AskForApproval, already_approved: bool) -> bool {
@@ -220,23 +343,15 @@ pub(crate) trait Approvable<Req> {
 
     /// Decide we can request an approval for no-sandbox execution.
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
-        !matches!(policy, AskForApproval::Never | AskForApproval::OnRequest)
+        match policy {
+            AskForApproval::UnlessTrusted => true,
+            AskForApproval::Never => false,
+            AskForApproval::OnRequest => false,
+            AskForApproval::Granular(granular_config) => granular_config.sandbox_approval,
+        }
     }
 
-    fn start_approval_async<'a>(
-        &'a mut self,
-        req: &'a Req,
-        ctx: ApprovalCtx<'a>,
-    ) -> BoxFuture<'a, ReviewDecision>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SandboxablePreference {
-    Auto,
-    #[allow(dead_code)] // Will be used by later tools.
-    Require,
-    #[allow(dead_code)] // Will be used by later tools.
-    Forbid,
+    fn approval_action(&self, req: &Req, call_id: &str) -> std::io::Result<ApprovalAction>;
 }
 
 pub(crate) trait Sandboxable {
@@ -246,11 +361,12 @@ pub(crate) trait Sandboxable {
     }
 }
 
-pub(crate) struct ToolCtx<'a> {
-    pub session: &'a Session,
-    pub turn: &'a TurnContext,
+pub(crate) struct ToolCtx {
+    pub session: Arc<Session>,
+    pub step_context: Arc<StepContext>,
+    pub cancellation_token: CancellationToken,
     pub call_id: String,
-    pub tool_name: String,
+    pub tool_name: ToolName,
 }
 
 #[derive(Debug)]
@@ -260,6 +376,20 @@ pub(crate) enum ToolError {
 }
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
+    fn turn_environment<'a>(&self, req: &'a Req) -> &'a TurnEnvironment;
+
+    fn uses_executor_managed_process_sandbox(&self, _req: &Req) -> bool {
+        false
+    }
+
+    fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApprovalSpec> {
+        None
+    }
+
+    fn sandbox_cwd<'a>(&self, _req: &'a Req) -> Option<&'a PathUri> {
+        None
+    }
+
     async fn run(
         &mut self,
         req: &Req,
@@ -269,58 +399,180 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 }
 
 pub(crate) struct SandboxAttempt<'a> {
-    pub sandbox: crate::exec::SandboxType,
-    pub policy: &'a crate::protocol::SandboxPolicy,
+    pub sandbox_override: SandboxOverride,
+    pub sandbox: SandboxType,
+    /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
+    pub sandbox_requested: bool,
+    pub permissions: &'a codex_protocol::models::PermissionProfile,
+    /// Canonical permissions before this host materializes workspace roots.
+    pub exec_server_permissions: &'a codex_protocol::models::PermissionProfile,
+    pub enforce_managed_network: bool,
     pub(crate) manager: &'a SandboxManager,
-    pub(crate) sandbox_cwd: &'a Path,
-    pub codex_linux_sandbox_exe: Option<&'a std::path::PathBuf>,
+    pub(crate) sandbox_cwd: &'a PathUri,
+    pub(crate) workspace_roots: &'a [PathUri],
+    pub sandbox_exe: Option<&'a std::path::PathBuf>,
+    // TODO(anp): Reconcile these attempt settings with TurnEnvironment::sandbox_context
+    // so process execution and patch writes honor the selected environment's backend.
+    pub use_legacy_landlock: bool,
+    pub windows_sandbox_type: SandboxType,
+    pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
+    pub network_denial_cancellation_token: Option<CancellationToken>,
+    pub(crate) network_proxy: Option<&'a NetworkProxy>,
+}
+
+pub(crate) fn executor_windows_sandbox_level(
+    windows_sandbox_type: SandboxType,
+    windows_sandbox_level: WindowsSandboxLevel,
+    cwd: &PathUri,
+) -> WindowsSandboxLevel {
+    if windows_sandbox_type != SandboxType::WindowsMxc
+        && windows_sandbox_level == WindowsSandboxLevel::Disabled
+        && cwd.infer_path_convention() == Some(PathConvention::Windows)
+    {
+        WindowsSandboxLevel::RestrictedToken
+    } else {
+        windows_sandbox_level
+    }
+}
+
+pub(crate) fn executor_windows_sandbox_selection(
+    windows_sandbox_type: SandboxType,
+    windows_sandbox_level: WindowsSandboxLevel,
+    cwd: &PathUri,
+) -> WindowsSandboxSelection {
+    configured_windows_sandbox_selection(
+        windows_sandbox_type,
+        executor_windows_sandbox_level(windows_sandbox_type, windows_sandbox_level, cwd),
+        cwd,
+    )
+}
+
+pub(crate) fn configured_windows_sandbox_selection(
+    windows_sandbox_type: SandboxType,
+    windows_sandbox_level: WindowsSandboxLevel,
+    cwd: &PathUri,
+) -> WindowsSandboxSelection {
+    if cwd.infer_path_convention() != Some(PathConvention::Windows) {
+        return WindowsSandboxSelection::Disabled;
+    }
+
+    if windows_sandbox_type == SandboxType::WindowsMxc {
+        WindowsSandboxSelection::Mxc
+    } else {
+        windows_sandbox_level.into()
+    }
 }
 
 impl<'a> SandboxAttempt<'a> {
-    pub fn env_for(
+    /// Whether this attempt bypasses sandboxing required by its ambient policy.
+    /// Use the requested policy, not the controller's wrapper, for remote executors.
+    pub(crate) fn is_escalated(&self) -> bool {
+        !self.sandbox_requested
+            && self.manager.should_sandbox(
+                self.permissions,
+                SandboxablePreference::Auto,
+                self.enforce_managed_network,
+            )
+    }
+
+    pub(crate) fn network_proxy<'b>(
+        &'b self,
+        fallback: Option<&'b NetworkProxy>,
+    ) -> Option<&'b NetworkProxy> {
+        // Execution-only proxies need no fallback; offline attempts must not revive one.
+        if self.enforce_managed_network {
+            self.network_proxy.or(fallback)
+        } else {
+            None
+        }
+    }
+
+    pub async fn env_for(
         &self,
-        spec: CommandSpec,
-    ) -> Result<crate::sandboxing::ExecEnv, SandboxTransformError> {
-        self.manager.transform(
-            spec,
-            self.policy,
-            self.sandbox,
-            self.sandbox_cwd,
-            self.codex_linux_sandbox_exe,
-        )
+        command: SandboxCommand,
+        options: ExecOptions,
+        network: Option<&NetworkProxy>,
+        environment_id: Option<&str>,
+    ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        let network = self.network_proxy(network);
+        let mut request = self
+            .manager
+            .transform(SandboxTransformRequest {
+                command,
+                permissions: self.permissions,
+                sandbox: self.sandbox,
+                enforce_managed_network: self.enforce_managed_network,
+                environment_id,
+                network,
+                sandbox_policy_cwd: self.sandbox_cwd,
+                sandbox_exe: self.sandbox_exe.map(std::path::PathBuf::as_path),
+                use_legacy_landlock: self.use_legacy_landlock,
+                windows_sandbox_level: self.windows_sandbox_level,
+            })
+            .map_err(CodexErr::from)?;
+        request.sandbox_override = self.sandbox_override;
+        let workspace_roots = self
+            .workspace_roots
+            .iter()
+            .map(PathUri::to_abs_path)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, workspace_roots)
+            .await
+    }
+
+    pub async fn env_for_exec_server(
+        &self,
+        command: SandboxCommand,
+        options: ExecOptions,
+    ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        let managed_network = command.managed_network.clone();
+        let exec_server_permissions = effective_permission_profile(
+            self.exec_server_permissions,
+            command.additional_permissions.as_ref(),
+        );
+        let mut request = self
+            .manager
+            .transform(SandboxTransformRequest {
+                command,
+                permissions: self.permissions,
+                // The exec-server must receive the native command, not this host's wrapper.
+                sandbox: SandboxType::None,
+                enforce_managed_network: self.enforce_managed_network,
+                environment_id: None,
+                network: None,
+                sandbox_policy_cwd: self.sandbox_cwd,
+                sandbox_exe: None,
+                use_legacy_landlock: self.use_legacy_landlock,
+                windows_sandbox_level: self.windows_sandbox_level,
+            })
+            .map_err(CodexErr::from)?;
+        request.sandbox_override = self.sandbox_override;
+        let mut exec_request =
+            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new())
+                .await?;
+        exec_request.exec_server_managed_network = managed_network;
+        if self.sandbox_requested {
+            exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
+                permissions: exec_server_permissions,
+                sandbox_override: self.sandbox_override,
+                cwd: exec_request.windows_sandbox_policy_cwd.clone(),
+                workspace_roots: self.workspace_roots.to_vec(),
+                user_home_dir: None,
+                temporary_directories: None,
+                windows_sandbox_selection: executor_windows_sandbox_selection(
+                    self.windows_sandbox_type,
+                    self.windows_sandbox_level,
+                    self.sandbox_cwd,
+                ),
+                windows_sandbox_proxy_settings_mode: None,
+                use_legacy_landlock: self.use_legacy_landlock,
+            });
+            exec_request.exec_server_enforce_managed_network = self.enforce_managed_network;
+        }
+        Ok(exec_request)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_protocol::protocol::NetworkAccess;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn external_sandbox_skips_exec_approval_on_request() {
-        assert_eq!(
-            default_exec_approval_requirement(
-                AskForApproval::OnRequest,
-                &SandboxPolicy::ExternalSandbox {
-                    network_access: NetworkAccess::Restricted,
-                },
-            ),
-            ExecApprovalRequirement::Skip {
-                bypass_sandbox: false,
-                proposed_execpolicy_amendment: None,
-            }
-        );
-    }
-
-    #[test]
-    fn restricted_sandbox_requires_exec_approval_on_request() {
-        assert_eq!(
-            default_exec_approval_requirement(AskForApproval::OnRequest, &SandboxPolicy::ReadOnly),
-            ExecApprovalRequirement::NeedsApproval {
-                reason: None,
-                proposed_execpolicy_amendment: None,
-            }
-        );
-    }
-}
+#[path = "sandboxing_tests.rs"]
+mod tests;

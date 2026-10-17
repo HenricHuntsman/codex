@@ -1,8 +1,8 @@
-use crate::auth::AuthProvider;
-use crate::auth::add_auth_headers;
+use crate::auth::SharedAuthProvider;
+use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
-use crate::telemetry::run_with_request_telemetry;
+use bytes::Bytes;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use codex_protocol::openai_models::ModelInfo;
@@ -11,55 +11,108 @@ use http::HeaderMap;
 use http::Method;
 use http::header::ETAG;
 use std::sync::Arc;
+use url::Url;
 
-pub struct ModelsClient<T: HttpTransport, A: AuthProvider> {
-    transport: T,
-    provider: Provider,
-    auth: A,
-    request_telemetry: Option<Arc<dyn RequestTelemetry>>,
+pub struct ModelsClient<T: HttpTransport> {
+    session: EndpointSession<T>,
 }
 
-impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
-    pub fn new(transport: T, provider: Provider, auth: A) -> Self {
+impl<T: HttpTransport> ModelsClient<T> {
+    pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
-            transport,
-            provider,
-            auth,
-            request_telemetry: None,
+            session: EndpointSession::new(transport, provider, auth),
         }
     }
 
-    pub fn with_telemetry(mut self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
-        self.request_telemetry = request;
-        self
+    pub fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
+        Self {
+            session: self.session.with_request_telemetry(request),
+        }
     }
 
-    fn path(&self) -> &'static str {
+    fn path() -> &'static str {
         "models"
     }
 
+    fn append_client_version_query(req: &mut codex_client::Request, client_version: &str) {
+        let separator = if req.url.contains('?') { '&' } else { '?' };
+        req.url = format!("{}{}client_version={client_version}", req.url, separator);
+    }
+
+    pub fn request_url(provider: &Provider, client_version: &str) -> String {
+        let mut request = provider.build_request(Method::GET, Self::path());
+        Self::append_client_version_query(&mut request, client_version);
+        request.url
+    }
+
+    /// Builds a full catalog URL, preserving provider routing parameters and client version.
+    pub fn catalog_request_url(
+        provider: &Provider,
+        catalog_url: &str,
+        client_version: &str,
+    ) -> Result<String, ApiError> {
+        let invalid = |message: &str| ApiError::InvalidRequest {
+            message: message.to_string(),
+        };
+        let mut url = Url::parse(catalog_url)
+            .map_err(|_| invalid("model_catalog_url must be an absolute URL"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(params) = &provider.query_params {
+                query.extend_pairs(params);
+            }
+            query.append_pair("client_version", client_version);
+        }
+        Ok(url.into())
+    }
+
+    /// Fetches and decodes a catalog, optionally bounding response bytes before decoding.
     pub async fn list_models(
         &self,
-        client_version: &str,
+        request_url: String,
         extra_headers: HeaderMap,
+        response_body_limit_bytes: Option<usize>,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
-        let builder = || {
-            let mut req = self.provider.build_request(Method::GET, self.path());
-            req.headers.extend(extra_headers.clone());
+        let (body, header_etag) = self
+            .list_models_raw(request_url, extra_headers, response_body_limit_bytes)
+            .await?;
+        let ModelsResponse { models } =
+            serde_json::from_slice::<ModelsResponse>(&body).map_err(|e| {
+                ApiError::Stream(format!(
+                    "failed to decode models response: {:?} at line {} column {} (body: {} bytes)",
+                    e.classify(),
+                    e.line(),
+                    e.column(),
+                    body.len()
+                ))
+            })?;
 
-            let separator = if req.url.contains('?') { '&' } else { '?' };
-            req.url = format!("{}{}client_version={client_version}", req.url, separator);
+        Ok((models, header_etag))
+    }
 
-            add_auth_headers(&self.auth, req)
-        };
-
-        let resp = run_with_request_telemetry(
-            self.provider.retry.to_policy(),
-            self.request_telemetry.clone(),
-            builder,
-            |req| self.transport.execute(req),
-        )
-        .await?;
+    /// Fetches a catalog using the provider's auth and retry policy without decoding it.
+    ///
+    /// Callers accepting provider-controlled catalogs must set a response-body limit
+    /// and validate the native response without including raw values in diagnostics.
+    pub async fn list_models_raw(
+        &self,
+        request_url: String,
+        extra_headers: HeaderMap,
+        response_body_limit_bytes: Option<usize>,
+    ) -> Result<(Bytes, Option<String>), ApiError> {
+        let resp = self
+            .session
+            .execute_with(
+                Method::GET,
+                Self::path(),
+                extra_headers,
+                /*body*/ None,
+                move |req| {
+                    req.url.clone_from(&request_url);
+                    req.response_body_limit_bytes = response_body_limit_bytes;
+                },
+            )
+            .await?;
 
         let header_etag = resp
             .headers
@@ -67,24 +120,17 @@ impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
-            .map_err(|e| {
-                ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
-                ))
-            })?;
-
-        Ok((models, header_etag))
+        Ok((resp.body, header_etag))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthError;
+    use crate::auth::AuthProvider;
+    use crate::auth::AuthProviderFuture;
     use crate::provider::RetryConfig;
-    use crate::provider::WireApi;
-    use async_trait::async_trait;
     use codex_client::Request;
     use codex_client::Response;
     use codex_client::StreamResponse;
@@ -114,7 +160,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
             *self.last_request.lock().unwrap() = Some(req);
@@ -139,8 +184,29 @@ mod tests {
     struct DummyAuth;
 
     impl AuthProvider for DummyAuth {
-        fn bearer_token(&self) -> Option<String> {
-            None
+        fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+    }
+
+    #[derive(Default)]
+    struct RetryAuth {
+        request_limits: Mutex<Vec<Option<usize>>>,
+    }
+
+    impl AuthProvider for RetryAuth {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+            headers.insert(http::header::AUTHORIZATION, "Bearer test".parse().unwrap());
+        }
+
+        fn apply_auth(&self, mut request: Request) -> AuthProviderFuture<'_> {
+            Box::pin(async move {
+                let mut limits = self.request_limits.lock().unwrap();
+                limits.push(request.response_body_limit_bytes);
+                if limits.len() == 1 {
+                    return Err(AuthError::Transient("retry authentication".to_string()));
+                }
+                self.add_auth_headers(&mut request.headers);
+                Ok(request)
+            })
         }
     }
 
@@ -149,7 +215,6 @@ mod tests {
             name: "test".to_string(),
             base_url: base_url.to_string(),
             query_params: None,
-            wire: WireApi::Responses,
             headers: HeaderMap::new(),
             retry: RetryConfig {
                 max_attempts: 1,
@@ -162,6 +227,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_request_url_preserves_routing_and_encodes_queries() {
+        let mut provider = provider("https://gateway.example/v1");
+        provider.query_params = Some(std::collections::HashMap::from([(
+            "api-version".to_string(),
+            "2026 09".to_string(),
+        )]));
+        let url = ModelsClient::<CapturingTransport>::catalog_request_url(
+            &provider,
+            "https://catalog.example/codex/models?deployment=one",
+            "1.2.3",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://catalog.example/codex/models?deployment=one&api-version=2026+09&client_version=1.2.3"
+        );
+    }
+
+    #[test]
+    fn catalog_request_url_rejects_relative_urls() {
+        let provider = provider("https://gateway.example/v1");
+        for catalog_url in ["/codex/models", "codex/models"] {
+            let error = ModelsClient::<CapturingTransport>::catalog_request_url(
+                &provider,
+                catalog_url,
+                "1.2.3",
+            )
+            .unwrap_err();
+            assert!(matches!(error, ApiError::InvalidRequest { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_limit_survives_auth_retry_without_limiting_other_models_requests() {
+        let transport = CapturingTransport::default();
+        let auth = Arc::new(RetryAuth::default());
+        let mut provider = provider("https://example.com/api/codex");
+        provider.retry.max_attempts = 2;
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport.clone(), provider, auth.clone());
+
+        client
+            .list_models(
+                request_url.clone(),
+                HeaderMap::new(),
+                /*response_body_limit_bytes*/ Some(64),
+            )
+            .await
+            .expect("limited request should succeed after auth retry");
+        {
+            let request = transport.last_request.lock().unwrap();
+            let request = request.as_ref().unwrap();
+            assert_eq!(request.response_body_limit_bytes, Some(64));
+            assert_eq!(request.url, request_url);
+            assert_eq!(request.headers[http::header::AUTHORIZATION], "Bearer test");
+        }
+
+        let (models, _) = client
+            .list_models(
+                request_url,
+                HeaderMap::new(),
+                /*response_body_limit_bytes*/ None,
+            )
+            .await
+            .expect("ordinary request on the same client should remain unbounded");
+        assert!(models.is_empty());
+        assert_eq!(
+            transport
+                .last_request
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .response_body_limit_bytes,
+            None
+        );
+        assert_eq!(
+            *auth.request_limits.lock().unwrap(),
+            vec![Some(64), Some(64), None]
+        );
+    }
+
     #[tokio::test]
     async fn appends_client_version_query() {
         let response = ModelsResponse { models: Vec::new() };
@@ -172,14 +320,16 @@ mod tests {
             etag: None,
         };
 
-        let client = ModelsClient::new(
-            transport.clone(),
-            provider("https://example.com/api/codex"),
-            DummyAuth,
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(
+                request_url,
+                HeaderMap::new(),
+                /*response_body_limit_bytes*/ None,
+            )
             .await
             .expect("request should succeed");
 
@@ -215,13 +365,11 @@ mod tests {
                     "supported_in_api": true,
                     "priority": 1,
                     "upgrade": null,
-                    "base_instructions": "base instructions",
-                    "supports_reasoning_summaries": false,
                     "support_verbosity": false,
                     "default_verbosity": null,
                     "apply_patch_tool_type": null,
                     "truncation_policy": {"mode": "bytes", "limit": 10_000},
-                    "supports_parallel_tool_calls": false,
+                    "supports_image_detail_original": false,
                     "context_window": 272_000,
                     "experimental_supported_tools": [],
                 }))
@@ -235,14 +383,16 @@ mod tests {
             etag: None,
         };
 
-        let client = ModelsClient::new(
-            transport,
-            provider("https://example.com/api/codex"),
-            DummyAuth,
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(
+                request_url,
+                HeaderMap::new(),
+                /*response_body_limit_bytes*/ None,
+            )
             .await
             .expect("request should succeed");
 
@@ -262,14 +412,16 @@ mod tests {
             etag: Some("\"abc\"".to_string()),
         };
 
-        let client = ModelsClient::new(
-            transport,
-            provider("https://example.com/api/codex"),
-            DummyAuth,
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let (models, etag) = client
-            .list_models("0.1.0", HeaderMap::new())
+            .list_models(
+                request_url,
+                HeaderMap::new(),
+                /*response_body_limit_bytes*/ None,
+            )
             .await
             .expect("request should succeed");
 

@@ -1,238 +1,607 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
-use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
-use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
+use crate::original_image_detail::sanitize_original_image_detail;
+use crate::session::session::Session;
+use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnContext;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::unified_exec::format_output_omission_marker;
+use crate::unified_exec::resolve_max_tokens;
+use codex_protocol::ResponseItemId;
+use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ShellToolCallParams;
-use codex_utils_string::take_bytes_at_char_boundary;
-use mcp_types::CallToolResult;
-use std::borrow::Cow;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::models::function_call_output_content_items_to_text;
+use codex_tools::LoadableToolSpec;
+use codex_tools::ToolName;
+use codex_utils_audio::estimate_audio_token_count;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::formatted_truncate_text;
+use codex_utils_output_truncation::truncate_function_output_payload;
+use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::with_serialization_allowance;
+use serde::Serialize;
+use serde_json::Value as JsonValue;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+pub use codex_tools::ToolOutput;
+pub use codex_tools::ToolPayload;
+
+pub(crate) fn boxed_tool_output<T>(output: T) -> Box<dyn ToolOutput>
+where
+    T: ToolOutput + 'static,
+{
+    Box::new(output)
+}
 
 pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
+
+/// Host-observed state for one call, owned outside its abortable dispatch task.
+/// Delivery does not finish the call: post-tool hooks can still be cancelled.
+#[derive(Default)]
+pub(crate) struct ToolCallState {
+    pub(crate) terminal_outcome_reached: AtomicBool,
+    pub(crate) delivered_assistant_message: OnceLock<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolCallSource {
+    Direct,
+    DirectPlaintextMessage,
+    CodeMode {
+        /// Runtime cell that issued the nested tool request.
+        cell_id: String,
+        /// Code-mode's per-cell tool invocation id. This is useful for
+        /// debugging the JS/runtime bridge, but it is not the Codex tool call id
+        /// because the runtime id only needs to be unique within one cell.
+        runtime_tool_call_id: String,
+    },
+}
 
 #[derive(Clone)]
 pub struct ToolInvocation {
     pub session: Arc<Session>,
+    // TODO(sayan): Remove this compatibility field once handlers use `step_context.turn`.
     pub turn: Arc<TurnContext>,
+    pub(crate) step_context: Arc<StepContext>,
+    pub cancellation_token: CancellationToken,
     pub tracker: SharedTurnDiffTracker,
     pub call_id: String,
-    pub tool_name: String,
+    pub tool_name: ToolName,
+    pub source: ToolCallSource,
     pub payload: ToolPayload,
 }
 
-#[derive(Clone, Debug)]
-pub enum ToolPayload {
-    Function {
-        arguments: String,
-    },
-    Custom {
-        input: String,
-    },
-    LocalShell {
-        params: ShellToolCallParams,
-    },
-    Mcp {
-        server: String,
-        tool: String,
-        raw_arguments: String,
-    },
+/// Identity of the model call that started a tool invocation, retained across code-mode waits.
+#[derive(Clone)]
+pub(crate) struct ToolCallOrigin {
+    /// Best-effort lookup: invocations without a matching history item still
+    /// retain their known window ID.
+    pub(crate) item_id: Option<ResponseItemId>,
+    pub(crate) window_id: String,
 }
 
-impl ToolPayload {
-    pub fn log_payload(&self) -> Cow<'_, str> {
-        match self {
-            ToolPayload::Function { arguments } => Cow::Borrowed(arguments),
-            ToolPayload::Custom { input } => Cow::Borrowed(input),
-            ToolPayload::LocalShell { params } => Cow::Owned(params.command.join(" ")),
-            ToolPayload::Mcp { raw_arguments, .. } => Cow::Borrowed(raw_arguments),
+impl ToolInvocation {
+    /// Returns the item and window that requested this call or started its code-mode cell.
+    pub(crate) async fn originating_call(&self) -> Option<ToolCallOrigin> {
+        if let ToolCallSource::CodeMode { cell_id, .. } = &self.source {
+            return self
+                .session
+                .services
+                .code_mode_service
+                .cell_originating_call(&codex_code_mode::CellId::new(cell_id.clone()));
         }
+
+        let item_id = self
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .rev()
+            .find_map(|item| match item {
+                ResponseItem::FunctionCall { id, call_id, .. }
+                | ResponseItem::CustomToolCall { id, call_id, .. }
+                    if call_id == &self.call_id =>
+                {
+                    id.clone()
+                }
+                _ => None,
+            });
+        Some(ToolCallOrigin {
+            item_id,
+            window_id: self.session.current_window_id().await,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct McpToolOutput {
+    pub result: CallToolResult,
+    pub tool_input: JsonValue,
+    // Keep the original metadata for hooks; this flag only controls analytics capture.
+    pub(crate) result_metadata_capture_allowed: bool,
+    pub wall_time: Duration,
+    pub original_image_detail_supported: bool,
+    pub truncation_policy: TruncationPolicy,
+}
+
+impl ToolOutput for McpToolOutput {
+    fn log_output(&self) -> String {
+        // Logging has its own budget; do not first apply the model-context budget.
+        let output = self.result.log_output();
+        let wall_time_seconds = self.wall_time.as_secs_f64();
+        let header = format!("Wall time: {wall_time_seconds:.4} seconds\nOutput:");
+        if output.is_empty() {
+            header
+        } else {
+            format!("{header}\n{output}")
+        }
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.result.success()
+    }
+
+    fn fallback_token_limit_override(&self) -> Option<usize> {
+        Some(with_serialization_allowance(self.truncation_policy).token_budget())
+    }
+
+    fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
+        ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: self.response_payload(),
+        }
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+        self.result.code_mode_result(payload)
+    }
+
+    fn tool_result_metadata(&self) -> Option<&JsonValue> {
+        if !self.result_metadata_capture_allowed {
+            return None;
+        }
+        self.result.meta.as_ref()
+    }
+
+    fn post_tool_use_input(&self, _payload: &ToolPayload) -> Option<JsonValue> {
+        Some(self.tool_input.clone())
+    }
+
+    fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
+        serde_json::to_value(&self.result).ok()
+    }
+}
+
+impl McpToolOutput {
+    fn response_payload(&self) -> FunctionCallOutputPayload {
+        let mut payload = self.result.as_function_call_output_payload();
+        if let Some(items) = payload.content_items_mut() {
+            sanitize_original_image_detail(self.original_image_detail_supported, items);
+        }
+
+        let wall_time_seconds = self.wall_time.as_secs_f64();
+        let header = format!("Wall time: {wall_time_seconds:.4} seconds\nOutput:");
+
+        match &mut payload.body {
+            FunctionCallOutputBody::Text(text) => {
+                if text.is_empty() {
+                    *text = header;
+                } else {
+                    *text = format!("{header}\n{text}");
+                }
+            }
+            FunctionCallOutputBody::ContentItems(items) => {
+                items.insert(0, FunctionCallOutputContentItem::InputText { text: header });
+            }
+        }
+
+        // History receives this budget in tokens. Code Mode keeps the raw result.
+        truncate_function_output_payload(
+            &mut payload,
+            with_serialization_allowance(self.truncation_policy),
+            estimate_audio_token_count,
+        );
+        payload
     }
 }
 
 #[derive(Clone)]
-pub enum ToolOutput {
-    Function {
-        // Plain text representation of the tool output.
-        content: String,
-        // Some tool calls such as MCP calls may return structured content that can get parsed into an array of polymorphic content items.
-        content_items: Option<Vec<FunctionCallOutputContentItem>>,
+pub struct ToolSearchOutput {
+    pub tools: Vec<LoadableToolSpec>,
+}
+
+impl ToolOutput for ToolSearchOutput {
+    fn log_output(&self) -> String {
+        let tools = self
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::to_value(tool).unwrap_or_else(|err| {
+                    JsonValue::String(format!("failed to serialize tool_search output: {err}"))
+                })
+            })
+            .collect();
+        JsonValue::Array(tools).to_string()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
+        ResponseInputItem::ToolSearchOutput {
+            call_id: call_id.to_string(),
+            status: "completed".to_string(),
+            execution: "client".to_string(),
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::to_value(tool).unwrap_or_else(|err| {
+                        JsonValue::String(format!("failed to serialize tool_search output: {err}"))
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+pub struct FunctionToolOutput {
+    pub body: Vec<FunctionCallOutputContentItem>,
+    pub success: Option<bool>,
+    pub post_tool_use_response: Option<JsonValue>,
+}
+
+impl FunctionToolOutput {
+    pub fn from_text(text: String, success: Option<bool>) -> Self {
+        Self {
+            body: vec![FunctionCallOutputContentItem::InputText { text }],
+            success,
+            post_tool_use_response: None,
+        }
+    }
+
+    pub fn from_content(
+        content: Vec<FunctionCallOutputContentItem>,
         success: Option<bool>,
-    },
-    Mcp {
-        result: Result<CallToolResult, String>,
-    },
+    ) -> Self {
+        Self {
+            body: content,
+            success,
+            post_tool_use_response: None,
+        }
+    }
+
+    pub fn into_text(self) -> String {
+        function_call_output_content_items_to_text(&self.body).unwrap_or_default()
+    }
 }
 
-impl ToolOutput {
-    pub fn log_preview(&self) -> String {
-        match self {
-            ToolOutput::Function { content, .. } => telemetry_preview(content),
-            ToolOutput::Mcp { result } => format!("{result:?}"),
-        }
+impl ToolOutput for FunctionToolOutput {
+    fn log_output(&self) -> String {
+        function_call_output_content_items_to_text(&self.body).unwrap_or_default()
     }
 
-    pub fn success_for_logging(&self) -> bool {
-        match self {
-            ToolOutput::Function { success, .. } => success.unwrap_or(true),
-            ToolOutput::Mcp { result } => result.is_ok(),
-        }
+    fn success_for_logging(&self) -> bool {
+        self.success.unwrap_or(true)
     }
 
-    pub fn into_response(self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        match self {
-            ToolOutput::Function {
-                content,
-                content_items,
-                success,
-            } => {
-                if matches!(payload, ToolPayload::Custom { .. }) {
-                    ResponseInputItem::CustomToolCallOutput {
-                        call_id: call_id.to_string(),
-                        output: content,
-                    }
-                } else {
-                    ResponseInputItem::FunctionCallOutput {
-                        call_id: call_id.to_string(),
-                        output: FunctionCallOutputPayload {
-                            content,
-                            content_items,
-                            success,
-                        },
-                    }
-                }
-            }
-            ToolOutput::Mcp { result } => ResponseInputItem::McpToolCallOutput {
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        function_tool_response(call_id, payload, self.body.clone(), self.success)
+    }
+
+    fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
+        self.post_tool_use_response.clone()
+    }
+}
+
+pub struct ApplyPatchToolOutput {
+    pub text: String,
+}
+
+impl ApplyPatchToolOutput {
+    pub fn from_text(text: String) -> Self {
+        Self { text }
+    }
+}
+
+impl ToolOutput for ApplyPatchToolOutput {
+    fn log_output(&self) -> String {
+        self.text.clone()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        function_tool_response(
+            call_id,
+            payload,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: self.text.clone(),
+            }],
+            Some(true),
+        )
+    }
+
+    fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
+        Some(JsonValue::String(self.text.clone()))
+    }
+
+    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        JsonValue::Object(serde_json::Map::new())
+    }
+}
+
+pub struct AbortedToolOutput {
+    pub message: String,
+}
+
+impl ToolOutput for AbortedToolOutput {
+    fn log_output(&self) -> String {
+        self.message.clone()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        false
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        match payload {
+            ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
                 call_id: call_id.to_string(),
-                result,
+                status: "completed".to_string(),
+                execution: "client".to_string(),
+                tools: Vec::new(),
             },
+            _ => function_tool_response(
+                call_id,
+                payload,
+                vec![FunctionCallOutputContentItem::InputText {
+                    text: self.message.clone(),
+                }],
+                /*success*/ None,
+            ),
         }
     }
 }
 
-fn telemetry_preview(content: &str) -> String {
-    let truncated_slice = take_bytes_at_char_boundary(content, TELEMETRY_PREVIEW_MAX_BYTES);
-    let truncated_by_bytes = truncated_slice.len() < content.len();
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecCommandToolOutput {
+    pub event_call_id: String,
+    pub chunk_id: String,
+    pub wall_time: Duration,
+    /// Raw bytes returned for this unified exec call before any truncation.
+    pub raw_output: Vec<u8>,
+    pub truncation_policy: TruncationPolicy,
+    pub max_output_tokens: Option<usize>,
+    pub process_id: Option<i32>,
+    pub exit_code: Option<i32>,
+    pub original_token_count: Option<usize>,
+    /// Bytes omitted by the output collection cap before model-facing truncation.
+    pub output_omitted_bytes: Option<NonZeroUsize>,
+    pub hook_command: Option<String>,
+}
 
-    let mut preview = String::new();
-    let mut lines_iter = truncated_slice.lines();
-    for idx in 0..TELEMETRY_PREVIEW_MAX_LINES {
-        match lines_iter.next() {
-            Some(line) => {
-                if idx > 0 {
-                    preview.push('\n');
-                }
-                preview.push_str(line);
+impl ToolOutput for ExecCommandToolOutput {
+    fn log_output(&self) -> String {
+        // The telemetry budget must not inherit the model's output-token limit.
+        let mut output = String::from_utf8_lossy(&self.raw_output).into_owned();
+        if let Some(omitted_bytes) = self.output_omitted_bytes {
+            let marker = format_output_omission_marker(omitted_bytes.get());
+            if !output.contains(&marker) {
+                output = format!("{marker}\n{output}");
             }
-            None => break,
+        }
+        format!("{}\n{output}", self.response_header())
+    }
+
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        function_tool_response(
+            call_id,
+            payload,
+            vec![FunctionCallOutputContentItem::InputText {
+                text: self.response_text(),
+            }],
+            Some(true),
+        )
+    }
+
+    fn post_tool_use_id(&self, call_id: &str) -> String {
+        if self.event_call_id.is_empty() {
+            call_id.to_string()
+        } else {
+            self.event_call_id.clone()
         }
     }
-    let truncated_by_lines = lines_iter.next().is_some();
 
-    if !truncated_by_bytes && !truncated_by_lines {
-        return content.to_string();
+    fn post_tool_use_input(&self, _payload: &ToolPayload) -> Option<JsonValue> {
+        self.hook_command
+            .as_ref()
+            .map(|command| serde_json::json!({ "command": command }))
     }
 
-    if preview.len() < truncated_slice.len()
-        && truncated_slice
-            .as_bytes()
-            .get(preview.len())
-            .is_some_and(|byte| *byte == b'\n')
-    {
-        preview.push('\n');
+    fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
+        if self.process_id.is_some() || self.hook_command.is_none() {
+            return None;
+        }
+
+        Some(JsonValue::String(
+            self.truncated_output_with_policy(self.model_output_policy()),
+        ))
     }
 
-    if !preview.is_empty() && !preview.ends_with('\n') {
-        preview.push('\n');
-    }
-    preview.push_str(TELEMETRY_PREVIEW_TRUNCATION_NOTICE);
+    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        #[derive(Serialize)]
+        struct UnifiedExecCodeModeResult {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            chunk_id: Option<String>,
+            wall_time_seconds: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            exit_code: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_id: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            original_token_count: Option<usize>,
+            output: String,
+        }
 
-    preview
+        let result = UnifiedExecCodeModeResult {
+            chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
+            wall_time_seconds: self.wall_time.as_secs_f64(),
+            exit_code: self.exit_code,
+            session_id: self.process_id,
+            original_token_count: self.original_token_count,
+            output: match self.max_output_tokens {
+                Some(max_tokens) => self.truncated_output(max_tokens),
+                None => String::from_utf8_lossy(&self.raw_output).to_string(),
+            },
+        };
+
+        serde_json::to_value(result).unwrap_or_else(|err| {
+            JsonValue::String(format!("failed to serialize exec result: {err}"))
+        })
+    }
+}
+
+impl ExecCommandToolOutput {
+    fn model_output_policy(&self) -> TruncationPolicy {
+        let requested_policy = TruncationPolicy::Tokens(resolve_max_tokens(self.max_output_tokens));
+        if requested_policy.byte_budget() < self.truncation_policy.byte_budget() {
+            requested_policy
+        } else {
+            self.truncation_policy
+        }
+    }
+
+    pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
+        self.truncated_output_with_policy(TruncationPolicy::Tokens(max_tokens))
+    }
+
+    fn truncated_output_with_policy(&self, policy: TruncationPolicy) -> String {
+        let text = String::from_utf8_lossy(&self.raw_output).to_string();
+        let Some(omitted_bytes) = self.output_omitted_bytes else {
+            return formatted_truncate_text(&text, policy);
+        };
+
+        let marker = format_output_omission_marker(omitted_bytes.get());
+        if text.len() <= policy.byte_budget() {
+            return if text.contains(&marker) {
+                text
+            } else {
+                format!("{marker}\n{text}")
+            };
+        }
+
+        let original_token_count = self
+            .original_token_count
+            .unwrap_or_else(|| approx_token_count(&text));
+        let truncated = truncate_text(&text, policy);
+        let omission_notice = if truncated.contains(&marker) {
+            String::new()
+        } else {
+            format!("{marker}\n")
+        };
+        format!(
+            "Warning: truncated output (original token count: {original_token_count})\n{omission_notice}\n{truncated}"
+        )
+    }
+
+    fn response_header(&self) -> String {
+        let mut sections = Vec::new();
+
+        if !self.chunk_id.is_empty() {
+            sections.push(format!("Chunk ID: {}", self.chunk_id));
+        }
+
+        let wall_time_seconds = self.wall_time.as_secs_f64();
+        sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
+
+        if let Some(exit_code) = self.exit_code {
+            sections.push(format!("Process exited with code {exit_code}"));
+        }
+
+        if let Some(process_id) = &self.process_id {
+            sections.push(format!("Process running with session ID {process_id}"));
+        }
+
+        if let Some(original_token_count) = self.original_token_count {
+            sections.push(format!("Original token count: {original_token_count}"));
+        }
+
+        sections.push("Output:".to_string());
+        sections.join("\n")
+    }
+
+    fn response_text(&self) -> String {
+        let header = self.response_header();
+        let output_budget = with_serialization_allowance(self.truncation_policy)
+            .byte_budget()
+            .saturating_sub(header.len().saturating_add(/*rhs*/ 1));
+        let mut policy = self.model_output_policy();
+        let mut output = self.truncated_output_with_policy(policy);
+
+        // History applies this same serialization budget to the complete response.
+        // Reserve room for metadata, warning headers, and the truncation marker so
+        // it does not truncate an already-truncated output a second time.
+        while output.len() > output_budget && policy.byte_budget() > 0 {
+            let excess_bytes = output.len() - output_budget;
+            policy = match policy {
+                TruncationPolicy::Bytes(bytes) => {
+                    TruncationPolicy::Bytes(bytes.saturating_sub(excess_bytes))
+                }
+                TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(
+                    tokens.saturating_sub(TruncationPolicy::Bytes(excess_bytes).token_budget()),
+                ),
+            };
+            output = self.truncated_output_with_policy(policy);
+        }
+
+        format!("{header}\n{output}")
+    }
+}
+
+fn function_tool_response(
+    call_id: &str,
+    payload: &ToolPayload,
+    body: Vec<FunctionCallOutputContentItem>,
+    success: Option<bool>,
+) -> ResponseInputItem {
+    let body = match body.as_slice() {
+        [FunctionCallOutputContentItem::InputText { text }] => {
+            FunctionCallOutputBody::Text(text.clone())
+        }
+        _ => FunctionCallOutputBody::ContentItems(body),
+    };
+
+    if matches!(payload, ToolPayload::Custom { .. }) {
+        return ResponseInputItem::CustomToolCallOutput {
+            call_id: call_id.to_string(),
+            name: None,
+            output: FunctionCallOutputPayload { body, success },
+        };
+    }
+
+    ResponseInputItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload { body, success },
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn custom_tool_calls_should_roundtrip_as_custom_outputs() {
-        let payload = ToolPayload::Custom {
-            input: "patch".to_string(),
-        };
-        let response = ToolOutput::Function {
-            content: "patched".to_string(),
-            content_items: None,
-            success: Some(true),
-        }
-        .into_response("call-42", &payload);
-
-        match response {
-            ResponseInputItem::CustomToolCallOutput { call_id, output } => {
-                assert_eq!(call_id, "call-42");
-                assert_eq!(output, "patched");
-            }
-            other => panic!("expected CustomToolCallOutput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn function_payloads_remain_function_outputs() {
-        let payload = ToolPayload::Function {
-            arguments: "{}".to_string(),
-        };
-        let response = ToolOutput::Function {
-            content: "ok".to_string(),
-            content_items: None,
-            success: Some(true),
-        }
-        .into_response("fn-1", &payload);
-
-        match response {
-            ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                assert_eq!(call_id, "fn-1");
-                assert_eq!(output.content, "ok");
-                assert!(output.content_items.is_none());
-                assert_eq!(output.success, Some(true));
-            }
-            other => panic!("expected FunctionCallOutput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn telemetry_preview_returns_original_within_limits() {
-        let content = "short output";
-        assert_eq!(telemetry_preview(content), content);
-    }
-
-    #[test]
-    fn telemetry_preview_truncates_by_bytes() {
-        let content = "x".repeat(TELEMETRY_PREVIEW_MAX_BYTES + 8);
-        let preview = telemetry_preview(&content);
-
-        assert!(preview.contains(TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
-        assert!(
-            preview.len()
-                <= TELEMETRY_PREVIEW_MAX_BYTES + TELEMETRY_PREVIEW_TRUNCATION_NOTICE.len() + 1
-        );
-    }
-
-    #[test]
-    fn telemetry_preview_truncates_by_lines() {
-        let content = (0..(TELEMETRY_PREVIEW_MAX_LINES + 5))
-            .map(|idx| format!("line {idx}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let preview = telemetry_preview(&content);
-        let lines: Vec<&str> = preview.lines().collect();
-
-        assert!(lines.len() <= TELEMETRY_PREVIEW_MAX_LINES + 1);
-        assert_eq!(lines.last(), Some(&TELEMETRY_PREVIEW_TRUNCATION_NOTICE));
-    }
-}
+#[path = "context_tests.rs"]
+mod tests;

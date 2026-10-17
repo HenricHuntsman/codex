@@ -1,5 +1,5 @@
 [package]
-edition = "2021"
+edition.workspace = true
 license.workspace = true
 name = "codex-utils-pty"
 version.workspace = true
@@ -10,7 +10,13 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 portable-pty = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+codex-utils-cargo-bin = { workspace = true }
+ctor = { workspace = true }
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 filedescriptor = "0.8.3"
@@ -19,6 +25,9 @@ log = { workspace = true }
 shared_library = "0.1.9"
 winapi = { version = "0.3.9", features = [
     "handleapi",
+    "jobapi",
+    "jobapi2",
+    "libloaderapi",
     "minwinbase",
     "processthreadsapi",
     "synchapi",
@@ -27,3 +36,8 @@ winapi = { version = "0.3.9", features = [
     "winerror",
     "winnt",
 ] }
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lib]
+doctest = false
