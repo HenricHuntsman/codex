@@ -6,14 +6,10 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
-## Connecting to MCP servers
+## Lifecycle hooks
 
-Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the configuration reference for the latest MCP server options:
-
-- https://developers.openai.com/codex/config-reference
-
-## Notify
-
-Codex can run a notification hook when the agent finishes a turn. See the configuration reference for the latest notification settings:
-
-- https://developers.openai.com/codex/config-reference
+Admins can set top-level `allow_managed_hooks_only = true` in
+`requirements.toml` to ignore user, project, and session hook configs while
+still allowing managed hooks from requirements and managed config layers. This
+setting is only supported in `requirements.toml`; putting it in `config.toml`
+does not enable managed-hooks-only mode.

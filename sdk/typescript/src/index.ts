@@ -35,5 +35,6 @@ export type {
   ApprovalMode,
   SandboxMode,
   ModelReasoningEffort,
+  WebSearchMode,
 } from "./threadOptions";
-export type { TurnOptions } from "./turnOptions";
+export type { CyberAccessProgram, TurnOptions } from "./turnOptions";

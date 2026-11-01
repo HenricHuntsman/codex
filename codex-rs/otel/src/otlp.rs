@@ -75,10 +75,26 @@ pub(crate) fn build_http_client(
     tls: &OtelTlsConfig,
     timeout_var: &str,
 ) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
+    if current_tokio_runtime_is_multi_thread() {
         tokio::task::block_in_place(|| build_http_client_inner(tls, timeout_var))
+    } else if tokio::runtime::Handle::try_current().is_ok() {
+        let tls = tls.clone();
+        let timeout_var = timeout_var.to_string();
+        std::thread::spawn(move || {
+            build_http_client_inner(&tls, &timeout_var).map_err(|err| err.to_string())
+        })
+        .join()
+        .map_err(|_| config_error("failed to join OTLP blocking HTTP client builder thread"))?
+        .map_err(config_error)
     } else {
         build_http_client_inner(tls, timeout_var)
+    }
+}
+
+pub(crate) fn current_tokio_runtime_is_multi_thread() -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+        Err(_) => false,
     }
 }
 
@@ -114,7 +130,7 @@ fn build_http_client_inner(
                     key_location.display()
                 ))
             })?;
-            builder = builder.identity(identity).https_only(true);
+            builder = builder.use_rustls_tls().identity(identity).https_only(true);
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(config_error(
@@ -127,6 +143,59 @@ fn build_http_client_inner(
     builder
         .build()
         .map_err(|error| Box::new(error) as Box<dyn Error>)
+}
+
+pub(crate) fn build_async_http_client(
+    factory: &codex_http_client::HttpClientFactory,
+    tls: Option<&OtelTlsConfig>,
+    timeout_var: &str,
+) -> Result<crate::network_policy::RuntimeHttpClient, Box<dyn Error>> {
+    let mut config = codex_http_client::HttpClientTlsConfig::default();
+
+    if let Some(tls) = tls {
+        if let Some(path) = tls.ca_certificate.as_ref() {
+            let (pem, location) = read_bytes(path)?;
+            config = config
+                .with_root_certificate_pem(pem.as_slice())
+                .map_err(|error| {
+                    config_error(format!(
+                        "failed to parse certificate {}: {error}",
+                        location.display()
+                    ))
+                })?;
+        }
+
+        match (&tls.client_certificate, &tls.client_private_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
+                let (key_pem, key_location) = read_bytes(key_path)?;
+                cert_pem.extend_from_slice(key_pem.as_slice());
+                config = config
+                    .with_client_identity_pem(cert_pem.as_slice())
+                    .map_err(|error| {
+                        config_error(format!(
+                            "failed to parse client identity using {} and {}: {error}",
+                            cert_location.display(),
+                            key_location.display()
+                        ))
+                    })?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(config_error(
+                    "client_certificate and client_private_key must both be provided for mTLS",
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+
+    Ok(crate::network_policy::RuntimeHttpClient {
+        client: codex_http_client::HttpClientBuilder::new()
+            .without_request_logging()
+            .build_with_tls(factory, codex_http_client::ClientRouteClass::Other, config),
+        timeout: resolve_otlp_timeout(timeout_var),
+        runtime: tokio::runtime::Handle::try_current()?,
+    })
 }
 
 pub(crate) fn resolve_otlp_timeout(signal_var: &str) -> Duration {
@@ -160,4 +229,102 @@ fn read_bytes(path: &AbsolutePathBuf) -> Result<(Vec<u8>, PathBuf), Box<dyn Erro
 
 fn config_error(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(io::Error::new(ErrorKind::InvalidData, message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+    use pretty_assertions::assert_eq;
+    use rcgen::CertifiedKey;
+    use rcgen::generate_simple_self_signed;
+    use std::fs;
+    use tempfile::TempDir;
+    use tokio::runtime::Builder;
+
+    #[test]
+    fn current_tokio_runtime_is_multi_thread_detects_runtime_flavor() {
+        assert!(!current_tokio_runtime_is_multi_thread());
+
+        let current_thread_runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        assert_eq!(
+            current_thread_runtime.block_on(async { current_tokio_runtime_is_multi_thread() }),
+            false
+        );
+
+        let multi_thread_runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+        assert_eq!(
+            multi_thread_runtime.block_on(async { current_tokio_runtime_is_multi_thread() }),
+            true
+        );
+    }
+
+    #[test]
+    fn build_http_client_works_in_current_thread_runtime() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        let client = runtime.block_on(async {
+            build_http_client(&OtelTlsConfig::default(), OTEL_EXPORTER_OTLP_TIMEOUT)
+        });
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_http_client_accepts_pem_client_identity() {
+        let (_temp_dir, tls) = write_test_mtls_config();
+
+        build_http_client(&tls, OTEL_EXPORTER_OTLP_TIMEOUT)
+            .expect("blocking HTTP client should accept PEM client identity");
+    }
+
+    #[tokio::test]
+    async fn build_async_http_client_accepts_pem_client_identity() {
+        let (_temp_dir, tls) = write_test_mtls_config();
+
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        build_async_http_client(&factory, Some(&tls), OTEL_EXPORTER_OTLP_TIMEOUT)
+            .expect("async HTTP client should accept PEM client identity");
+    }
+
+    fn write_test_mtls_config() -> (TempDir, OtelTlsConfig) {
+        let temp_dir = tempfile::tempdir().expect("temporary TLS fixture directory");
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("test certificate should generate");
+        let certificate_path = temp_dir.path().join("client.pem");
+        let private_key_path = temp_dir.path().join("client-key.pem");
+        fs::write(&certificate_path, cert.pem()).expect("client certificate should write");
+        fs::write(&private_key_path, signing_key.serialize_pem())
+            .expect("client private key should write");
+
+        (
+            temp_dir,
+            OtelTlsConfig {
+                ca_certificate: Some(
+                    AbsolutePathBuf::from_absolute_path(&certificate_path)
+                        .expect("CA certificate path should be absolute"),
+                ),
+                client_certificate: Some(
+                    AbsolutePathBuf::from_absolute_path(&certificate_path)
+                        .expect("client certificate path should be absolute"),
+                ),
+                client_private_key: Some(
+                    AbsolutePathBuf::from_absolute_path(&private_key_path)
+                        .expect("client private key path should be absolute"),
+                ),
+            },
+        )
+    }
 }

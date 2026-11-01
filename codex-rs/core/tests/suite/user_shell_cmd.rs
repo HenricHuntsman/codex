@@ -1,15 +1,25 @@
 use anyhow::Context;
-use codex_core::NewThread;
-use codex_core::ThreadManager;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::ExecCommandEndEvent;
-use codex_core::protocol::ExecCommandSource;
-use codex_core::protocol::ExecOutputStream;
-use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol::TurnAbortReason;
+use codex_core::TurnInputRequest;
+use codex_features::Feature;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecOutputStream;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnEnvironmentRequests;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::user_input::UserInput;
+use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use core_test_support::assert_regex_match;
-use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -19,12 +29,20 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::submit_thread_settings;
+use core_test_support::test_codex::local;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_with_timeout;
+use pretty_assertions::assert_eq;
 use regex_lite::escape;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use tokio::time::Duration;
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
@@ -37,48 +55,54 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
         .await
         .expect("write temp file");
 
-    // Load config and pin cwd to the temp dir so ls/cat operate there.
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.cwd = cwd.path().to_path_buf();
-
-    let thread_manager = ThreadManager::with_models_provider(
-        codex_core::CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-    );
-    let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config)
+    // Pin cwd to the temp dir so ls/cat operate there.
+    let server = start_mock_server().await;
+    let cwd_path = cwd.path().to_path_buf();
+    let mut builder = test_codex().with_config(move |config| {
+        config.cwd = cwd_path.abs();
+    });
+    let codex = builder
+        .build(&server)
         .await
-        .expect("create new conversation");
+        .expect("create new conversation")
+        .codex;
 
     // 1) shell command should list the file
     let list_cmd = "ls".to_string();
     codex
-        .submit(Op::RunUserShellCommand { command: list_cmd })
+        .submit(Op::RunUserShellCommand {
+            command: list_cmd,
+            timeout_ms: None,
+        })
         .await
         .unwrap();
     let msg = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandEnd(_))).await;
     let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-        stdout, exit_code, ..
+        aggregated_output,
+        exit_code,
+        ..
     }) = msg
     else {
         unreachable!()
     };
     assert_eq!(exit_code, 0);
     assert!(
-        stdout.contains(file_name),
-        "ls output should include {file_name}, got: {stdout:?}"
+        aggregated_output.contains(file_name),
+        "ls output should include {file_name}, got: {aggregated_output:?}"
     );
 
     // 2) shell command should print the file contents verbatim
     let cat_cmd = format!("cat {file_name}");
     codex
-        .submit(Op::RunUserShellCommand { command: cat_cmd })
+        .submit(Op::RunUserShellCommand {
+            command: cat_cmd,
+            timeout_ms: None,
+        })
         .await
         .unwrap();
     let msg = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandEnd(_))).await;
     let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-        mut stdout,
+        mut aggregated_output,
         exit_code,
         ..
     }) = msg
@@ -88,48 +112,306 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
     assert_eq!(exit_code, 0);
     if cfg!(windows) {
         // Windows shells emit CRLF line endings; normalize so the assertion remains portable.
-        stdout = stdout.replace("\r\n", "\n");
+        aggregated_output = aggregated_output.replace("\r\n", "\n");
     }
-    assert_eq!(stdout, contents);
+    assert_eq!(aggregated_output, contents);
+}
+
+#[tokio::test]
+async fn user_shell_command_without_local_environment_emits_error() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build(&server).await?;
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            environments: Some(codex_protocol::protocol::TurnEnvironmentRequests::new(
+                test.config.cwd.clone(),
+                vec![],
+            )),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    test.codex
+        .submit(Op::RunUserShellCommand {
+            command: "echo shell".to_string(),
+            timeout_ms: None,
+        })
+        .await?;
+
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(error.message, "shell is unavailable in this session");
+    assert_eq!(error.codex_error_info, None);
+
+    Ok(())
 }
 
 #[tokio::test]
 async fn user_shell_cmd_can_be_interrupted() {
     // Set up isolated config and conversation.
-    let codex_home = TempDir::new().unwrap();
-    let config = load_default_config_for_test(&codex_home).await;
-    let thread_manager = ThreadManager::with_models_provider(
-        codex_core::CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-    );
-    let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config)
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let fixture = builder
+        .build(&server)
         .await
         .expect("create new conversation");
+    let codex = &fixture.codex;
 
-    // Start a long-running command and then interrupt it.
-    let sleep_cmd = "sleep 5".to_string();
+    // Start a long-running command and then interrupt it before its deadline.
     codex
-        .submit(Op::RunUserShellCommand { command: sleep_cmd })
+        .submit(Op::RunUserShellCommand {
+            command: slow_user_shell_command().to_string(),
+            timeout_ms: Some(28_800_000),
+        })
         .await
         .unwrap();
 
-    // Wait until it has started (ExecCommandBegin), then interrupt.
-    let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandBegin(_))).await;
+    // Output proves that the process was spawned before cancellation.
+    wait_for_event(codex, |event| {
+        matches!(event, EventMsg::ExecCommandOutputDelta(delta)
+            if String::from_utf8_lossy(&delta.chunk).contains("shell-timeout-ready"))
+    })
+    .await;
     codex.submit(Op::Interrupt).await.unwrap();
 
     // Expect a TurnAborted(Interrupted) notification.
-    let msg = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
+    let msg = wait_for_event_with_timeout(
+        codex,
+        |ev| matches!(ev, EventMsg::TurnAborted(_)),
+        Duration::from_secs(60),
+    )
+    .await;
     let EventMsg::TurnAborted(ev) = msg else {
         unreachable!()
     };
     assert_eq!(ev.reason, TurnAbortReason::Interrupted);
 }
 
+#[tokio::test]
+async fn user_shell_command_honors_default_and_extended_deadlines() -> anyhow::Result<()> {
+    for (timeout_ms, expected_ms) in [(None, 3_600_000), (Some(28_800_000), 28_800_000)] {
+        let server = start_mock_server().await;
+        // Honor the CI executor while retaining the local environment used by user shell commands.
+        let mut builder = test_codex();
+        let fixture = builder.build_with_remote_and_local_env(&server).await?;
+        // The remote cwd need not exist on the host, and may use a different path convention.
+        let local_cwd = fixture.cwd_path().abs();
+        let mut environments = vec![local(local_cwd.clone())];
+        if fixture.executor_environment().environment().is_remote() {
+            environments.insert(
+                /*index*/ 0,
+                fixture.executor_environment().selection().clone(),
+            );
+        }
+        submit_thread_settings(
+            &fixture.codex,
+            ThreadSettingsOverrides {
+                environments: Some(TurnEnvironmentRequests::new(
+                    local_cwd,
+                    environments
+                        .into_iter()
+                        .map(TurnEnvironmentSelection::into_request)
+                        .collect(),
+                )),
+                ..Default::default()
+            },
+        )
+        .await?;
+        fixture
+            .codex
+            .submit(Op::RunUserShellCommand {
+                command: slow_user_shell_command().to_string(),
+                timeout_ms,
+            })
+            .await?;
+        wait_for_event(&fixture.codex, |event| {
+            matches!(event, EventMsg::ExecCommandOutputDelta(delta)
+                if String::from_utf8_lossy(&delta.chunk).contains("shell-timeout-ready"))
+        })
+        .await;
+
+        let completed = async {
+            loop {
+                let event = fixture.codex.next_event().await.expect("read shell event");
+                if let EventMsg::ExecCommandEnd(end) = event.msg {
+                    break end;
+                }
+            }
+        };
+        tokio::pin!(completed);
+
+        // Leave time for shell startup, and let process I/O and reaping use real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(expected_ms - 60_000)).await;
+        tokio::time::resume();
+        assert!(
+            timeout(Duration::from_millis(250), &mut completed)
+                .await
+                .is_err(),
+            "shell command expired before its {expected_ms} ms deadline"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        let end = timeout(Duration::from_secs(10), &mut completed).await?;
+        assert_eq!(end.exit_code, -1);
+        assert!(end.aggregated_output.contains("Timeout"));
+        assert!(end.aggregated_output.contains("shell-timeout-ready"));
+        wait_for_event(&fixture.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+    Ok(())
+}
+
+fn slow_user_shell_command() -> &'static str {
+    match codex_core::shell::default_user_shell().name() {
+        "powershell" => "Write-Output shell-timeout-ready; Start-Sleep -Seconds 60",
+        "cmd" => "echo shell-timeout-ready & ping -n 61 127.0.0.1 > nul",
+        _ => "printf 'shell-timeout-ready\\n'; exec sleep 60",
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.4");
+    let fixture = builder.build(&server).await?;
+
+    let call_id = "active-turn-shell-call";
+    let args = if cfg!(windows) {
+        serde_json::json!({
+            "cmd": "Start-Sleep -Seconds 2; Write-Output model-shell",
+            "yield_time_ms": 10_000,
+        })
+    } else {
+        serde_json::json!({
+            "cmd": "sleep 2; echo model-shell",
+            "yield_time_ms": 10_000,
+        })
+    };
+    let first = sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+        ev_completed("resp-1"),
+    ]);
+    let second = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_sequence(&server, vec![first, second]).await;
+
+    let cwd = fixture.config.cwd.clone();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
+
+    fixture
+        .codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "run model shell command".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(cwd)),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: fixture.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    let _ = wait_for_event_match(&fixture.codex, |ev| match ev {
+        EventMsg::ExecCommandBegin(event)
+            if event.source == ExecCommandSource::UnifiedExecStartup =>
+        {
+            Some(event.clone())
+        }
+        _ => None,
+    })
+    .await;
+
+    #[cfg(windows)]
+    let user_shell_command = "Write-Output user-shell".to_string();
+    #[cfg(not(windows))]
+    let user_shell_command = "printf user-shell".to_string();
+    fixture
+        .codex
+        .submit(Op::RunUserShellCommand {
+            command: user_shell_command,
+            timeout_ms: None,
+        })
+        .await?;
+
+    let mut saw_replaced_abort = false;
+    let mut saw_user_shell_end = false;
+    let mut saw_turn_complete = false;
+    for _ in 0..200 {
+        let event = timeout(Duration::from_secs(20), fixture.codex.next_event())
+            .await
+            .context("timed out waiting for event")?
+            .context("event stream ended unexpectedly")?;
+        match event.msg {
+            EventMsg::TurnAborted(ev) if ev.reason == TurnAbortReason::Replaced => {
+                saw_replaced_abort = true;
+            }
+            EventMsg::ExecCommandEnd(ev) if ev.source == ExecCommandSource::UserShell => {
+                saw_user_shell_end = true;
+            }
+            EventMsg::TurnComplete(_) => {
+                saw_turn_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_turn_complete, "expected turn to complete");
+    assert!(
+        saw_user_shell_end,
+        "expected user shell command to finish while turn was active"
+    );
+    assert!(
+        !saw_replaced_abort,
+        "user shell command should not replace the active turn"
+    );
+
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "active turn should continue and issue the follow-up model request"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
-    let mut builder = core_test_support::test_codex::test_codex();
+    // Disable it to ease command matching.
+    let mut builder = core_test_support::test_codex::test_codex().with_config(move |config| {
+        config
+            .features
+            .disable(Feature::ShellSnapshot)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build(&server).await?;
 
     #[cfg(windows)]
@@ -140,6 +422,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     test.codex
         .submit(Op::RunUserShellCommand {
             command: command.clone(),
+            timeout_ms: None,
         })
         .await?;
 
@@ -173,7 +456,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     })
     .await;
     assert_eq!(end_event.exit_code, 0);
-    assert_eq!(end_event.stdout.trim(), "not-set");
+    assert_eq!(end_event.aggregated_output.trim(), "not-set");
 
     let _ = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -203,6 +486,53 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     Ok(())
 }
 
+#[tokio::test]
+async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let mut builder = core_test_support::test_codex::test_codex().with_config(|config| {
+        let file_system_sandbox_policy = config.permissions.file_system_sandbox_policy();
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::from_runtime_permissions(
+                &file_system_sandbox_policy,
+                NetworkSandboxPolicy::Restricted,
+            ))
+            .expect("set permission profile");
+    });
+    let test = builder.build(&server).await?;
+
+    #[cfg(windows)]
+    let command = r#"$val = $env:CODEX_SANDBOX_NETWORK_DISABLED; if ([string]::IsNullOrEmpty($val)) { $val = 'not-set' } ; [System.Console]::Write($val)"#.to_string();
+    #[cfg(not(windows))]
+    let command =
+        r#"sh -c "printf '%s' \"${CODEX_SANDBOX_NETWORK_DISABLED:-not-set}\"""#.to_string();
+
+    test.codex
+        .submit(Op::RunUserShellCommand {
+            command,
+            timeout_ms: None,
+        })
+        .await?;
+
+    let ExecCommandEndEvent {
+        exit_code,
+        aggregated_output,
+        ..
+    } = wait_for_event_match(&test.codex, |ev| match ev {
+        EventMsg::ExecCommandEnd(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(
+        exit_code, 0,
+        "shell command should execute successfully. output=`{aggregated_output}`",
+    );
+    assert_eq!(aggregated_output.trim(), "not-set");
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))] // TODO: unignore on windows
 async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<()> {
@@ -223,6 +553,7 @@ async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<(
     test.codex
         .submit(Op::RunUserShellCommand {
             command: command.clone(),
+            timeout_ms: None,
         })
         .await?;
 
@@ -254,8 +585,9 @@ async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<(
 
     let head = (1..=69).map(|i| format!("{i}\n")).collect::<String>();
     let tail = (352..=400).map(|i| format!("{i}\n")).collect::<String>();
-    let truncated_body =
-        format!("Total output lines: 400\n\n{head}70…273 tokens truncated…351\n{tail}");
+    let truncated_body = format!(
+        "Warning: truncated output (original token count: 373)\nTotal output lines: 400\n\n{head}70…273 tokens truncated…351\n{tail}"
+    );
     let escaped_command = escape(&command);
     let escaped_truncated_body = escape(&truncated_body);
     let expected_pattern = format!(
@@ -272,23 +604,21 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex()
-        .with_model("gpt-5.1-codex")
-        .with_config(|config| {
-            config.tool_output_token_limit = Some(100);
-        });
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.tool_output_token_limit = Some(100);
+    });
     let fixture = builder.build(&server).await?;
 
     let call_id = "user-shell-double-truncation";
     let args = if cfg!(windows) {
         serde_json::json!({
-            "command": "for ($i=1; $i -le 2000; $i++) { Write-Output $i }",
-            "timeout_ms": 5_000,
+            "cmd": "for ($i=1; $i -le 2000; $i++) { Write-Output $i }",
+            "yield_time_ms": 5_000,
         })
     } else {
         serde_json::json!({
-            "command": "seq 1 2000",
-            "timeout_ms": 5_000,
+            "cmd": "seq 1 2000",
+            "yield_time_ms": 5_000,
         })
     };
 
@@ -296,7 +626,7 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-1"),
         ]),
     )
@@ -311,22 +641,22 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_policy(
-            "trigger big shell_command output",
-            SandboxPolicy::DangerFullAccess,
+        .submit_turn_with_permission_profile(
+            "trigger big exec_command output",
+            PermissionProfile::Disabled,
         )
         .await?;
 
     let output = mock2
         .single_request()
         .function_call_output_text(call_id)
-        .context("function_call_output present for shell_command call")?;
+        .context("function_call_output present for exec_command call")?;
 
     let truncation_headers = output.matches("Total output lines:").count();
 
     assert_eq!(
         truncation_headers, 1,
-        "shell_command output should carry only one truncation header: {output}"
+        "exec_command output should carry only one truncation header: {output}"
     );
 
     Ok(())

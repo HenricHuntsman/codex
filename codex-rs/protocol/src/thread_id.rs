@@ -10,9 +10,19 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TS, Hash)]
 #[ts(type = "string")]
+/// Identifier for a Codex thread.
+///
+/// Codex-generated thread IDs are UUIDv7, and some use cases rely on that.
 pub struct ThreadId {
-    uuid: Uuid,
+    pub(crate) uuid: Uuid,
 }
+
+/// Identifier encoded in a rollout filename.
+///
+/// Rollout IDs use the same UUID representation as thread IDs. Ordinary rollout files use the
+/// thread ID as their rollout ID; \`thread/revert\` creates a new rollout file with a distinct
+/// rollout ID while preserving the thread ID.
+pub type RolloutId = ThreadId;
 
 impl ThreadId {
     pub fn new() -> Self {
@@ -21,10 +31,39 @@ impl ThreadId {
         }
     }
 
+    /// Construct an identifier from a UUID's 128-bit representation.
+    pub fn from_u128(value: u128) -> Self {
+        Self {
+            uuid: Uuid::from_u128(value),
+        }
+    }
+
     pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
         Ok(Self {
             uuid: Uuid::parse_str(s)?,
         })
+    }
+}
+
+impl TryFrom<&str> for ThreadId {
+    type Error = uuid::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::from_string(value)
+    }
+}
+
+impl TryFrom<String> for ThreadId {
+    type Error = uuid::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_string(value.as_str())
+    }
+}
+
+impl From<ThreadId> for String {
+    fn from(value: ThreadId) -> Self {
+        value.to_string()
     }
 }
 
@@ -36,7 +75,7 @@ impl Default for ThreadId {
 
 impl Display for ThreadId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.uuid)
+        Display::fmt(&self.uuid, f)
     }
 }
 
@@ -70,13 +109,10 @@ impl JsonSchema for ThreadId {
     }
 }
 
-/// Backward-compatible alias for the previous name.
-#[deprecated(note = "use ThreadId instead")]
-pub type ConversationId = ThreadId;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_thread_id_default_is_not_zeroes() {
         let id = ThreadId::default();
