@@ -1,14 +1,16 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 1980
 expression: popup
 ---
-  Select Approval Mode
+  Update Model Permissions
 
-› 1. Read Only (current)  Requires approval to edit files and run commands.
-  2. Agent                Read and edit files, and run commands.
-  3. Agent (full access)  Codex can edit files outside this workspace and run
-                          commands with network access. Exercise caution when
-                          using.
 
-  Press enter to confirm or esc to go back
+› 1. Read Only (current)  Read workspace files, with approval required for edits
+                          or internet access
+  2. Ask for approval     Read and edit workspace files and run commands, with
+                          approval required for internet access or edits outside
+                          the workspace
+  3. Full Access          Use with caution: Codex can edit files outside this
+                          workspace and access the internet without approval
+
+  enter select · esc back

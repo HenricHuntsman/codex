@@ -1,417 +1,242 @@
-use crate::client_common::tools::ToolSpec;
-use crate::error::Result;
-pub use codex_api::common::ResponseEvent;
+pub use codex_api::ResponseEvent;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_tools::ToolSpec;
 use futures::Stream;
-use serde::Deserialize;
 use serde_json::Value;
-use std::borrow::Cow;
-use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
-/// Review thread system prompt. Edit `core/src/review_prompt.md` to customize.
-pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
-
-// Centralized templates for review-related user messages
-pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exit_success.xml");
-pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =
-    include_str!("../templates/review/exit_interrupted.xml");
-
-/// API request payload for a single model turn
-#[derive(Default, Debug, Clone)]
+/// Core inputs to provider request formatting for a single model turn.
+/// The rollout trace serializes this shape before transport-specific rewrites.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Prompt {
     /// Conversation context input items.
+    #[serde(serialize_with = "codex_rollout_trace::serialize_trace_items")]
     pub input: Vec<ResponseItem>,
 
-    /// Tools available to the model, including additional tools sourced from
-    /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
+    /// Tool definitions to inject into this request, empty when supplied by history.
+    pub(crate) tools: Arc<[ToolSpec]>,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
 
-    /// Optional override for the built-in BASE_INSTRUCTIONS.
-    pub base_instructions_override: Option<String>,
+    pub base_instructions: BaseInstructions,
 
     /// Optional the output schema for the model's response.
     pub output_schema: Option<Value>,
+
+    /// Whether the Responses API should strictly validate `output_schema`.
+    pub output_schema_strict: bool,
+
+    pub(crate) prompt_cache_ttl: Option<crate::PromptCacheTtl>,
+
+    pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,
+}
+
+impl Default for Prompt {
+    fn default() -> Self {
+        Self {
+            input: Vec::new(),
+            tools: Arc::default(),
+            parallel_tool_calls: false,
+            base_instructions: BaseInstructions::default(),
+            output_schema: None,
+            output_schema_strict: true,
+            prompt_cache_ttl: None,
+            cyber_access_program: None,
+        }
+    }
 }
 
 impl Prompt {
-    pub(crate) fn get_full_instructions<'a>(&'a self, model: &'a ModelInfo) -> Cow<'a, str> {
-        Cow::Borrowed(
-            self.base_instructions_override
-                .as_deref()
-                .unwrap_or(model.base_instructions.as_str()),
-        )
-    }
-
-    pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
+    pub(crate) fn get_formatted_input_for_request(
+        &self,
+        model_info: &ModelInfo,
+    ) -> Vec<ResponseItem> {
         let mut input = self.input.clone();
-
-        // when using the *Freeform* apply_patch tool specifically, tool outputs
-        // should be structured text, not json. Do NOT reserialize when using
-        // the Function tool - note that this differs from the check above for
-        // instructions. We declare the result as a named variable for clarity.
-        let is_freeform_apply_patch_tool_present = self.tools.iter().any(|tool| match tool {
-            ToolSpec::Freeform(f) => f.name == "apply_patch",
-            _ => false,
-        });
-        if is_freeform_apply_patch_tool_present {
-            reserialize_shell_outputs(&mut input);
-        }
-
+        normalize_image_details(&mut input, model_info);
         input
     }
 }
 
-fn reserialize_shell_outputs(items: &mut [ResponseItem]) {
-    let mut shell_call_ids: HashSet<String> = HashSet::new();
-
-    items.iter_mut().for_each(|item| match item {
-        ResponseItem::LocalShellCall { call_id, id, .. } => {
-            if let Some(identifier) = call_id.clone().or_else(|| id.clone()) {
-                shell_call_ids.insert(identifier);
+fn normalize_image_details(items: &mut [ResponseItem], model_info: &ModelInfo) {
+    for item in items {
+        match item {
+            ResponseItem::Message { content, .. } => {
+                for content_item in content {
+                    if let ContentItem::InputImage { detail, .. } = content_item {
+                        normalize_image_detail(detail, model_info);
+                    }
+                }
             }
-        }
-        ResponseItem::CustomToolCall {
-            id: _,
-            status: _,
-            call_id,
-            name,
-            input: _,
-        } => {
-            if name == "apply_patch" {
-                shell_call_ids.insert(call_id.clone());
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                if let Some(content) = output.content_items_mut() {
+                    for content_item in content {
+                        if let FunctionCallOutputContentItem::InputImage { detail, .. } =
+                            content_item
+                        {
+                            normalize_image_detail(detail, model_info);
+                        }
+                    }
+                }
             }
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Reasoning { .. }
+            | ResponseItem::AgentMessage { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::ImageGenerationCall { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
+            | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ContextCompaction { .. }
+            | ResponseItem::Other => {}
         }
-        ResponseItem::CustomToolCallOutput { call_id, output } => {
-            if shell_call_ids.remove(call_id)
-                && let Some(structured) = parse_structured_shell_output(output)
-            {
-                *output = structured
-            }
-        }
-        ResponseItem::FunctionCall { name, call_id, .. }
-            if is_shell_tool_name(name) || name == "apply_patch" =>
-        {
-            shell_call_ids.insert(call_id.clone());
-        }
-        ResponseItem::FunctionCallOutput { call_id, output } => {
-            if shell_call_ids.remove(call_id)
-                && let Some(structured) = parse_structured_shell_output(&output.content)
-            {
-                output.content = structured
-            }
-        }
-        _ => {}
-    })
-}
-
-fn is_shell_tool_name(name: &str) -> bool {
-    matches!(name, "shell" | "container.exec")
-}
-
-#[derive(Deserialize)]
-struct ExecOutputJson {
-    output: String,
-    metadata: ExecOutputMetadataJson,
-}
-
-#[derive(Deserialize)]
-struct ExecOutputMetadataJson {
-    exit_code: i32,
-    duration_seconds: f32,
-}
-
-fn parse_structured_shell_output(raw: &str) -> Option<String> {
-    let parsed: ExecOutputJson = serde_json::from_str(raw).ok()?;
-    Some(build_structured_output(&parsed))
-}
-
-fn build_structured_output(parsed: &ExecOutputJson) -> String {
-    let mut sections = Vec::new();
-    sections.push(format!("Exit code: {}", parsed.metadata.exit_code));
-    sections.push(format!(
-        "Wall time: {} seconds",
-        parsed.metadata.duration_seconds
-    ));
-
-    let mut output = parsed.output.clone();
-    if let Some((stripped, total_lines)) = strip_total_output_header(&parsed.output) {
-        sections.push(format!("Total output lines: {total_lines}"));
-        output = stripped.to_string();
     }
-
-    sections.push("Output:".to_string());
-    sections.push(output);
-
-    sections.join("\n")
 }
 
-fn strip_total_output_header(output: &str) -> Option<(&str, u32)> {
-    let after_prefix = output.strip_prefix("Total output lines: ")?;
-    let (total_segment, remainder) = after_prefix.split_once('\n')?;
-    let total_lines = total_segment.parse::<u32>().ok()?;
-    let remainder = remainder.strip_prefix('\n').unwrap_or(remainder);
-    Some((remainder, total_lines))
-}
-
-pub(crate) mod tools {
-    use crate::tools::spec::JsonSchema;
-    use serde::Deserialize;
-    use serde::Serialize;
-
-    /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
-    /// Responses API.
-    #[derive(Debug, Clone, Serialize, PartialEq)]
-    #[serde(tag = "type")]
-    pub(crate) enum ToolSpec {
-        #[serde(rename = "function")]
-        Function(ResponsesApiTool),
-        #[serde(rename = "local_shell")]
-        LocalShell {},
-        // TODO: Understand why we get an error on web_search although the API docs say it's supported.
-        // https://platform.openai.com/docs/guides/tools-web-search?api-mode=responses#:~:text=%7B%20type%3A%20%22web_search%22%20%7D%2C
-        // The `external_web_access` field determines whether the web search is over cached or live content.
-        // https://platform.openai.com/docs/guides/tools-web-search#live-internet-access
-        #[serde(rename = "web_search")]
-        WebSearch {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            external_web_access: Option<bool>,
-        },
-        #[serde(rename = "custom")]
-        Freeform(FreeformTool),
+fn normalize_image_detail(detail: &mut Option<ImageDetail>, model_info: &ModelInfo) {
+    if model_info.use_responses_lite {
+        *detail = None;
+    } else if *detail == Some(ImageDetail::Original) && !model_info.supports_image_detail_original {
+        *detail = Some(DEFAULT_IMAGE_DETAIL);
     }
+}
 
-    impl ToolSpec {
-        pub(crate) fn name(&self) -> &str {
-            match self {
-                ToolSpec::Function(tool) => tool.name.as_str(),
-                ToolSpec::LocalShell {} => "local_shell",
-                ToolSpec::WebSearch { .. } => "web_search",
-                ToolSpec::Freeform(tool) => tool.name.as_str(),
-            }
+/// Whether the producer has posted a response's bill and deferred a turn error.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum ChargePosting {
+    #[default]
+    Unposted,
+    Posted,
+    PostedTurnExhausted,
+}
+
+/// Carries the hook price and the response producer's billing state.
+#[derive(Debug, Default)]
+pub(crate) struct SamplingCharge {
+    pub(crate) hooks: codex_hooks::ModelRequestHookOutcome,
+    pub(crate) posting: ChargePosting,
+}
+
+/// Core consumes a terminal event and its hook output together. Other readers
+/// of the public response stream still see the provider's unmodified event.
+#[derive(Debug)]
+pub(crate) struct SamplingEvent {
+    pub(crate) event: Result<ResponseEvent>,
+    pub(crate) hook_output: SamplingCharge,
+}
+
+/// The provider's usage and the hook's contribution describe the same
+/// response. Keeping them separate preserves the provider's original numbers.
+#[derive(Debug)]
+pub(crate) struct SamplingUsage {
+    pub(crate) provider: Option<codex_protocol::protocol::TokenUsage>,
+    pub(crate) charge: SamplingCharge,
+}
+
+#[cfg(test)]
+impl From<codex_protocol::protocol::TokenUsage> for SamplingUsage {
+    fn from(provider: codex_protocol::protocol::TokenUsage) -> Self {
+        Self {
+            provider: Some(provider),
+            charge: Default::default(),
+        }
+    }
+}
+
+impl From<Result<ResponseEvent>> for SamplingEvent {
+    fn from(event: Result<ResponseEvent>) -> Self {
+        Self {
+            event,
+            hook_output: Default::default(),
+        }
+    }
+}
+
+/// A sampling consumer receives the hook outcome with the provider event it settles.
+pub(crate) struct SamplingStream {
+    pub(crate) routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
+    pub(crate) rx_event: mpsc::Receiver<SamplingEvent>,
+    pub(crate) interrupt: Option<oneshot::Sender<codex_api::ResponseInterrupt>>,
+    /// Signals the mapper task that the consumer stopped polling before the
+    /// provider stream reached its own terminal event.
+    pub(crate) consumer_dropped: CancellationToken,
+    /// Once settlement begins, a steer waits for its terminal accounting decision.
+    pub(crate) settlement_started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SamplingStream {
+    /// A cancelled turn discards any queued event, including an incomplete response's usage.
+    pub(crate) fn accept_for_turn(
+        event: Option<SamplingEvent>,
+        cancellation: &CancellationToken,
+    ) -> Option<SamplingEvent> {
+        if cancellation.is_cancelled() {
+            Some(Err(CodexErr::TurnAborted).into())
+        } else {
+            event
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct FreeformTool {
-        pub(crate) name: String,
-        pub(crate) description: String,
-        pub(crate) format: FreeformToolFormat,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct FreeformToolFormat {
-        pub(crate) r#type: String,
-        pub(crate) syntax: String,
-        pub(crate) definition: String,
-    }
-
-    #[derive(Debug, Clone, Serialize, PartialEq)]
-    pub struct ResponsesApiTool {
-        pub(crate) name: String,
-        pub(crate) description: String,
-        /// TODO: Validation. When strict is set to true, the JSON schema,
-        /// `required` and `additional_properties` must be present. All fields in
-        /// `properties` must be present in `required`.
-        pub(crate) strict: bool,
-        pub(crate) parameters: JsonSchema,
+    pub(crate) async fn next_for_turn(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Option<SamplingEvent> {
+        let event = tokio::select! {
+            biased;
+            event = self.rx_event.recv() => event,
+            () = cancellation.cancelled() => return Some(Err(CodexErr::TurnAborted).into()),
+        };
+        Self::accept_for_turn(event, cancellation)
     }
 }
 
-pub struct ResponseStream {
-    pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
-}
-
-impl Stream for ResponseStream {
-    type Item = Result<ResponseEvent>;
+impl Stream for SamplingStream {
+    type Item = SamplingEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx_event.poll_recv(cx)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use codex_api::ResponsesApiRequest;
-    use codex_api::common::OpenAiVerbosity;
-    use codex_api::common::TextControls;
-    use codex_api::create_text_param_for_request;
-    use pretty_assertions::assert_eq;
-
-    use crate::config::test_config;
-    use crate::models_manager::manager::ModelsManager;
-
-    use super::*;
-
-    struct InstructionsTestCase {
-        pub slug: &'static str,
-        pub expects_apply_patch_instructions: bool,
-    }
-    #[test]
-    fn get_full_instructions_no_user_content() {
-        let prompt = Prompt {
-            ..Default::default()
-        };
-        let prompt_with_apply_patch_instructions =
-            include_str!("../prompt_with_apply_patch_instructions.md");
-        let test_cases = vec![
-            InstructionsTestCase {
-                slug: "gpt-3.5",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-4.1",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-4o",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "codex-mini-latest",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-oss:120b",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1-codex",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1-codex-max",
-                expects_apply_patch_instructions: false,
-            },
-        ];
-        for test_case in test_cases {
-            let config = test_config();
-            let model_info = ModelsManager::construct_model_info_offline(test_case.slug, &config);
-            if test_case.expects_apply_patch_instructions {
-                assert_eq!(
-                    model_info.base_instructions.as_str(),
-                    prompt_with_apply_patch_instructions
-                );
-            }
-
-            let expected = model_info.base_instructions.as_str();
-            let full = prompt.get_full_instructions(&model_info);
-            assert_eq!(full, expected);
-        }
-    }
-
-    #[test]
-    fn serializes_text_verbosity_when_set() {
-        let input: Vec<ResponseItem> = vec![];
-        let tools: Vec<serde_json::Value> = vec![];
-        let req = ResponsesApiRequest {
-            model: "gpt-5.1",
-            instructions: "i",
-            input: &input,
-            tools: &tools,
-            tool_choice: "auto",
-            parallel_tool_calls: true,
-            reasoning: None,
-            store: false,
-            stream: true,
-            include: vec![],
-            prompt_cache_key: None,
-            text: Some(TextControls {
-                verbosity: Some(OpenAiVerbosity::Low),
-                format: None,
-            }),
-        };
-
-        let v = serde_json::to_value(&req).expect("json");
-        assert_eq!(
-            v.get("text")
-                .and_then(|t| t.get("verbosity"))
-                .and_then(|s| s.as_str()),
-            Some("low")
-        );
-    }
-
-    #[test]
-    fn serializes_text_schema_with_strict_format() {
-        let input: Vec<ResponseItem> = vec![];
-        let tools: Vec<serde_json::Value> = vec![];
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "answer": {"type": "string"}
-            },
-            "required": ["answer"],
-        });
-        let text_controls =
-            create_text_param_for_request(None, &Some(schema.clone())).expect("text controls");
-
-        let req = ResponsesApiRequest {
-            model: "gpt-5.1",
-            instructions: "i",
-            input: &input,
-            tools: &tools,
-            tool_choice: "auto",
-            parallel_tool_calls: true,
-            reasoning: None,
-            store: false,
-            stream: true,
-            include: vec![],
-            prompt_cache_key: None,
-            text: Some(text_controls),
-        };
-
-        let v = serde_json::to_value(&req).expect("json");
-        let text = v.get("text").expect("text field");
-        assert!(text.get("verbosity").is_none());
-        let format = text.get("format").expect("format field");
-
-        assert_eq!(
-            format.get("name"),
-            Some(&serde_json::Value::String("codex_output_schema".into()))
-        );
-        assert_eq!(
-            format.get("type"),
-            Some(&serde_json::Value::String("json_schema".into()))
-        );
-        assert_eq!(format.get("strict"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(format.get("schema"), Some(&schema));
-    }
-
-    #[test]
-    fn omits_text_when_not_set() {
-        let input: Vec<ResponseItem> = vec![];
-        let tools: Vec<serde_json::Value> = vec![];
-        let req = ResponsesApiRequest {
-            model: "gpt-5.1",
-            instructions: "i",
-            input: &input,
-            tools: &tools,
-            tool_choice: "auto",
-            parallel_tool_calls: true,
-            reasoning: None,
-            store: false,
-            stream: true,
-            include: vec![],
-            prompt_cache_key: None,
-            text: None,
-        };
-
-        let v = serde_json::to_value(&req).expect("json");
-        assert!(v.get("text").is_none());
+impl Drop for SamplingStream {
+    fn drop(&mut self) {
+        self.consumer_dropped.cancel();
     }
 }
+
+/// Response events for low-level client requests that do not run sampling hooks.
+pub struct ResponseStream(pub(crate) SamplingStream);
+
+impl Stream for ResponseStream {
+    type Item = Result<ResponseEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|event| event.map(|event| event.event))
+    }
+}
+
+#[cfg(test)]
+#[path = "client_common_tests.rs"]
+mod tests;

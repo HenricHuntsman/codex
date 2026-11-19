@@ -1,7 +1,12 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde::Deserialize;
+use serde::Serialize;
 
 pub(crate) const STATSIG_OTLP_HTTP_ENDPOINT: &str = "https://ab.chatgpt.com/otlp/v1/metrics";
 pub(crate) const STATSIG_API_KEY_HEADER: &str = "statsig-api-key";
@@ -10,7 +15,11 @@ pub(crate) const STATSIG_API_KEY: &str = "client-MkRuleRQBd6qakfnDYqJVR9JuXcY57L
 pub(crate) fn resolve_exporter(exporter: &OtelExporter) -> OtelExporter {
     match exporter {
         OtelExporter::Statsig => {
-            if cfg!(test) || cfg!(feature = "disable-default-metrics-exporter") {
+            // Keep the built-in Statsig default off in debug builds so
+            // incremental local development and test runs do not emit
+            // best-effort OTEL traffic unless a test or binary opts into an
+            // explicit exporter configuration.
+            if cfg!(debug_assertions) {
                 return OtelExporter::None;
             }
 
@@ -28,8 +37,23 @@ pub(crate) fn resolve_exporter(exporter: &OtelExporter) -> OtelExporter {
     }
 }
 
+/// Validates configured span attributes before they are attached to exported spans.
+pub fn validate_span_attributes(attributes: &HashMap<String, String>) -> std::io::Result<()> {
+    if attributes.keys().any(String::is_empty) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configured span attribute key must not be empty",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct OtelSettings {
+    /// Optional credential helper shared by explicitly configured OTLP HTTP exporters.
+    pub headers_helper: Option<OtelHeadersHelper>,
+    pub http_client_factory: codex_http_client::HttpClientFactory,
     pub environment: String,
     pub service_name: String,
     pub service_version: String,
@@ -37,6 +61,41 @@ pub struct OtelSettings {
     pub exporter: OtelExporter,
     pub trace_exporter: OtelExporter,
     pub metrics_exporter: OtelExporter,
+    pub runtime_metrics: bool,
+    pub span_attributes: HashMap<String, String>,
+    pub tracestate: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// A shared command for explicit OTLP HTTP exporters; never used by built-in analytics.
+/// The command prints a JSON object of strings.
+/// Its headers override static headers. A failed run suspends exports until recovery.
+#[derive(Clone)]
+pub struct OtelHeadersHelper {
+    pub command: String,
+    /// A managed executable runs directly from its parent directory. User commands run from Codex home.
+    pub managed: bool,
+    pub refresh_interval: Duration,
+    /// Signals whose exporter is authorized to receive this helper's headers.
+    pub apply_to_logs: bool,
+    pub apply_to_traces: bool,
+    pub apply_to_metrics: bool,
+}
+
+impl fmt::Debug for OtelHeadersHelper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OtelHeadersHelper")
+            .field("command", &"[REDACTED]")
+            .field("refresh_interval", &self.refresh_interval)
+            .finish()
+    }
+}
+
+/// Resolved Statsig metrics settings that another process can use to recreate
+/// the built-in metrics exporter configuration without receiving generic
+/// exporter credentials in-process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsigMetricsSettings {
+    pub environment: String,
 }
 
 #[derive(Clone, Debug)]
@@ -72,4 +131,18 @@ pub enum OtelExporter {
         protocol: OtelHttpProtocol,
         tls: Option<OtelTlsConfig>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OtelExporter;
+    use super::resolve_exporter;
+
+    #[test]
+    fn statsig_default_metrics_exporter_is_disabled_in_debug_builds() {
+        assert!(matches!(
+            resolve_exporter(&OtelExporter::Statsig),
+            OtelExporter::None
+        ));
+    }
 }

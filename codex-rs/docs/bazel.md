@@ -4,7 +4,7 @@ This repository uses Bazel to build the Rust workspace under `codex-rs`.
 Cargo remains the source of truth for crates and features, while Bazel
 provides hermetic builds, toolchains, and cross-platform artifacts.
 
-As of 1/9/2026, this setup is still experimental as we stabilize it.
+As of 6/1/2026, this setup is still experimental as we stabilize it.
 
 ## High-level layout
 
@@ -20,10 +20,36 @@ As of 1/9/2026, this setup is still experimental as we stabilize it.
   makes some adjustments if the crate needs additional compile-time or runtime data,
   or other customizations.
 
+## Running Bazel locally
+
+The repository root `justfile` exposes the common Bazel entry points:
+
+```bash
+just bazel-test
+just bazel-clippy
+```
+
+Ordinary local `bazel` and `just` invocations run locally. The checked-in
+Bazel configuration does not define third-party remote cache or execution
+endpoints.
+
 ## Evolving the setup
 
 When you add or change Rust dependencies, update the Cargo.toml/Cargo.lock as normal.
-The Bazel build should automatically pick things up without any manual action needed.
+Then refresh the Bzlmod lockfile from the repo root:
+
+```bash
+just bazel-lock-update
+```
+
+This runs `bazel mod deps --lockfile_mode=update` and updates `MODULE.bazel.lock` if needed.
+Commit the lockfile changes along with your Cargo lockfile update.
+
+To verify lockfile alignment locally (the same check CI runs), use:
+
+```bash
+just bazel-lock-check
+```
 
 In some cases, an upstream crate may need a patch or a `crate.annotation` in `../MODULE.bzl`
 to have it build in Bazel's sandbox or make it cross-compilation-friendly. If you see issues,

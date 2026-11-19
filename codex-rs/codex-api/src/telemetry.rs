@@ -1,3 +1,4 @@
+use crate::error::ApiError;
 use codex_client::Request;
 use codex_client::RequestTelemetry;
 use codex_client::Response;
@@ -26,6 +27,19 @@ pub trait SseTelemetry: Send + Sync {
         >,
         duration: Duration,
     );
+}
+
+/// Telemetry for Responses WebSocket transport.
+pub trait WebsocketTelemetry: Send + Sync {
+    /// Reports how long it took to send the request and whether the send failed.
+    fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool);
+
+    /// Reports the poll duration for timeouts, stream errors, end of stream,
+    /// and binary, close, or raw frames.
+    fn on_ws_receive_failure(&self, duration: Duration);
+
+    /// Reports each text frame and its poll duration. `kind` is `None` if decoding the stream event failed.
+    fn on_ws_text_event(&self, text: &str, kind: Option<&str>, duration: Duration);
 }
 
 pub(crate) trait WithStatus {
